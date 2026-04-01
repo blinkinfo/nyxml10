@@ -59,7 +59,7 @@ async def _fetch_candle(slot_start_ts: int) -> tuple[float, float] | None:
         "end": slot_start_ts + 600,
     }
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             resp = await client.get(cfg.COINBASE_CANDLE_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
