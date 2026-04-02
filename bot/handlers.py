@@ -309,7 +309,7 @@ async def cmd_download_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer("Preparing CSV...")
     rows = await queries.get_all_signals_for_export()
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id", "slot_start", "side", "entry_price", "is_win"])
+    writer = csv.DictWriter(buf, fieldnames=["id", "slot_start", "side", "entry_price", "is_win", "pattern"])
     writer.writeheader()
     writer.writerows(rows)
     buf.seek(0)
@@ -329,9 +329,9 @@ async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Signals"
-    ws.append(["id", "slot_start", "side", "entry_price", "is_win"])
+    ws.append(["id", "slot_start", "side", "entry_price", "is_win", "pattern"])
     for r in rows:
-        ws.append([r["id"], r["slot_start"], r["side"], r["entry_price"], r["is_win"]])
+        ws.append([r["id"], r["slot_start"], r["side"], r["entry_price"], r["is_win"], r.get("pattern", "")])
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

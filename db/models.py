@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS signals (
     is_win INTEGER,
     resolved_at TIMESTAMP,
     skipped INTEGER DEFAULT 0,
-    filter_blocked INTEGER DEFAULT 0
+    filter_blocked INTEGER DEFAULT 0,
+    pattern TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -105,6 +106,8 @@ async def migrate_db(db_path: str | None = None) -> None:
         sig_columns = {row[1] for row in await cursor2.fetchall()}
         if "filter_blocked" not in sig_columns:
             await db.execute("ALTER TABLE signals ADD COLUMN filter_blocked INTEGER DEFAULT 0")
+        if "pattern" not in sig_columns:
+            await db.execute("ALTER TABLE signals ADD COLUMN pattern TEXT")
 
         # Seed any missing default settings (idempotent)
         for key, value in DEFAULT_SETTINGS.items():

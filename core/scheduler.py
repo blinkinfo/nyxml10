@@ -387,6 +387,7 @@ async def _check_and_trade() -> None:
         entry_price=entry_price,
         opposite_price=opposite_price,
         skipped=False,
+        pattern=pattern,
     )
 
     # 3. TradeManager passthrough (filters removed — always allowed)

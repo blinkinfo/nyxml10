@@ -67,11 +67,13 @@ async def insert_signal(
                                    # The pre-trade filter was removed; this
                                    # column is always written as False (0) and
                                    # is never set to True by any active code path.
+    pattern: str | None = None,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, "
-            "entry_price, opposite_price, skipped, filter_blocked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "entry_price, opposite_price, skipped, filter_blocked, pattern) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 slot_start,
                 slot_end,
@@ -81,6 +83,7 @@ async def insert_signal(
                 opposite_price,
                 1 if skipped else 0,
                 1 if filter_blocked else 0,
+                pattern,
             ),
         )
         await db.commit()
@@ -528,7 +531,7 @@ async def get_all_signals_for_export() -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, slot_start, side, entry_price, is_win "
+            "SELECT id, slot_start, side, entry_price, is_win, pattern "
             "FROM signals WHERE skipped = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
