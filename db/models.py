@@ -86,6 +86,39 @@ async def init_db(db_path: str | None = None) -> None:
         await db.commit()
 
 
+# The 4 condition IDs incorrectly redeemed from the wrong address (sig-type-2 bug).
+# Deleting these records lets the redeemer retry them on the next scan.
+_BAD_CONDITION_IDS = [
+    "0x46b556649c109de10c5be1be2dbc4ee3155909fee0d99230e17dbd51020fcb35",
+    "0x1b447392bdf148658a553757511a4a9320ec36486ac42727fbe7c93a192158ae",
+    "0x0fe4e91b6df78899d791e19fdf8176d8bcf242fde888190115fa66dc4b724d85",
+    "0x6daf71ed6a57d96e62563df405159ef67ccfcdd1206e8139ef417c03ba4b26c7",
+]
+
+
+async def cleanup_bad_redemptions(db_path: str | None = None) -> int:
+    """One-time startup cleanup: delete incorrectly recorded redemption rows.
+
+    These 4 conditions were broadcast from the wrong address (EOA instead of
+    the proxy wallet) due to the sig-type-2 bug.  Removing the 'success'
+    records allows the redeemer to retry them on the next scan.
+
+    Safe to run repeatedly -- if no rows match, rowcount is 0.
+    Returns total rows deleted.
+    """
+    path = db_path or cfg.DB_PATH
+    total = 0
+    async with aiosqlite.connect(path) as db:
+        for cid in _BAD_CONDITION_IDS:
+            cursor = await db.execute(
+                "DELETE FROM redemptions WHERE condition_id = ? AND dry_run = 0",
+                (cid,),
+            )
+            total += cursor.rowcount
+        await db.commit()
+    return total
+
+
 async def migrate_db(db_path: str | None = None) -> None:
     """Add new columns to existing tables if they don't exist (safe to run repeatedly)."""
     path = db_path or cfg.DB_PATH

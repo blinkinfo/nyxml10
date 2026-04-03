@@ -12,7 +12,7 @@ from telegram.ext import Application
 import config as cfg
 from bot import handlers
 from core.scheduler import recover_unresolved, start_scheduler
-from db.models import init_db, migrate_db
+from db.models import cleanup_bad_redemptions, init_db, migrate_db
 from polymarket.client import PolymarketClient
 
 logging.basicConfig(
@@ -53,6 +53,13 @@ def main() -> None:
     # 1. Init DB synchronously first (create tables, seed defaults)
     asyncio.run(init_db())
     log.info("Database initialised at %s", cfg.DB_PATH)
+
+    # One-time cleanup: remove bad redemption records from sig-type-2 bug
+    _deleted = asyncio.run(cleanup_bad_redemptions())
+    if _deleted:
+        log.info("Startup cleanup: deleted %d bad redemption record(s)", _deleted)
+    else:
+        log.debug("Startup cleanup: no bad redemption records found (already clean)")
 
     # 2. Init Polymarket client (synchronous — derives creds)
     poly_client: PolymarketClient | None = None

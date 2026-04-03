@@ -246,8 +246,31 @@ def _redeem_position_sync(
 
     try:
         ctf = _get_ctf_contract(w3)
-        # Derive the transaction sender from the signing key to guarantee match.
-        account = w3.eth.account.from_key(private_key).address
+
+        # For signature type 2 (Polymarket proxy wallet), the proxy wallet
+        # holds the CTF tokens — NOT the EOA derived from the private key.
+        # The private key is used ONLY for signing; the `from` address must
+        # be the proxy wallet that actually owns the positions.
+        signer_address = w3.eth.account.from_key(private_key).address
+        sig_type = cfg.POLYMARKET_SIGNATURE_TYPE
+        if sig_type == 2 and cfg.POLYMARKET_FUNDER_ADDRESS:
+            account = Web3.to_checksum_address(cfg.POLYMARKET_FUNDER_ADDRESS)
+            if account.lower() != signer_address.lower():
+                log.warning(
+                    "Sig type 2: using proxy wallet %s as `from` (signer EOA is %s). "
+                    "Tokens are held by the proxy wallet.",
+                    account,
+                    signer_address,
+                )
+        else:
+            account = signer_address
+            if sig_type == 2 and not cfg.POLYMARKET_FUNDER_ADDRESS:
+                log.error(
+                    "POLYMARKET_SIGNATURE_TYPE=2 but POLYMARKET_FUNDER_ADDRESS is not set! "
+                    "Redemption will use EOA address %s which likely holds no tokens.",
+                    account,
+                )
+
         collateral = Web3.to_checksum_address(USDC_E_ADDRESS)
 
         # parentCollectionId = 0x00...00 (top-level condition)

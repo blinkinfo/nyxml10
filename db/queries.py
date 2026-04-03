@@ -332,6 +332,21 @@ async def redemption_already_recorded(condition_id: str) -> bool:
         return row is not None
 
 
+async def delete_redemptions_for_condition(condition_id: str) -> int:
+    """Delete ALL redemption records for *condition_id* (any status, non-dry-run).
+
+    Use this to clear incorrectly recorded 'success' entries so the scheduler
+    will retry redemption on the next scan.  Returns the number of rows deleted.
+    """
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            "DELETE FROM redemptions WHERE condition_id = ? AND dry_run = 0",
+            (condition_id,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
 async def get_redemption_stats() -> dict[str, Any]:
     """Aggregate stats for the /redemptions command dashboard."""
     async with aiosqlite.connect(_db()) as db:
@@ -637,3 +652,21 @@ async def get_recent_demo_trades(n: int = 10) -> list[dict[str, Any]]:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+
+async def delete_failed_redemptions_by_condition(condition_id: str) -> int:
+    """Delete all non-dry-run redemption records for *condition_id* regardless of status.
+
+    Used to clear incorrectly recorded 'success' entries caused by the
+    sig-type-2 / wrong-from-address bug, so the redeemer will attempt them
+    again on the next scan.
+
+    Returns the number of rows deleted.
+    """
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            "DELETE FROM redemptions WHERE condition_id = ? AND dry_run = 0",
+            (condition_id,),
+        )
+        await db.commit()
+        return cursor.rowcount
