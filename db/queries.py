@@ -704,3 +704,74 @@ async def delete_failed_redemptions_by_condition(condition_id: str) -> int:
         )
         await db.commit()
         return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Pattern analytics
+# ---------------------------------------------------------------------------
+
+async def get_pattern_stats() -> list[dict[str, Any]]:
+    """Return per-pattern performance stats across all resolved real trades.
+
+    Joins signals -> trades on signal_id, groups by pattern, and computes:
+      - total trades, wins, losses, win_pct, wl_ratio
+      - total_deployed (USDC), net_pnl, roi_pct
+      - last_seen (most recent slot_start for that pattern)
+
+    Only resolved real trades (is_demo=0, is_win IS NOT NULL) are counted.
+    Patterns are sorted by win_pct DESC, then total_trades DESC.
+    """
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                s.pattern                          AS pattern,
+                COUNT(t.id)                        AS total_trades,
+                SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN t.is_win = 0 THEN 1 ELSE 0 END) AS losses,
+                SUM(t.amount_usdc)                 AS total_deployed,
+                SUM(COALESCE(t.pnl, 0))            AS net_pnl,
+                MAX(s.slot_start)                  AS last_seen
+            FROM trades t
+            JOIN signals s ON t.signal_id = s.id
+            WHERE t.is_demo = 0
+              AND t.is_win IS NOT NULL
+              AND s.pattern IS NOT NULL
+              AND s.pattern != ''
+            GROUP BY s.pattern
+            ORDER BY
+                (SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(t.id)) DESC,
+                COUNT(t.id) DESC
+            """
+        )
+        rows = await cursor.fetchall()
+
+    result = []
+    for r in rows:
+        total   = r["total_trades"]
+        wins    = r["wins"]
+        losses  = r["losses"]
+        deployed = float(r["total_deployed"] or 0)
+        pnl     = float(r["net_pnl"] or 0)
+        win_pct = round(wins / total * 100, 1) if total else 0.0
+        wl_ratio = round(wins / losses, 2) if losses else float("inf")
+        roi_pct = round(pnl / deployed * 100, 1) if deployed else 0.0
+        result.append({
+            "pattern":        r["pattern"],
+            "total_trades":   total,
+            "wins":           wins,
+            "losses":         losses,
+            "win_pct":        win_pct,
+            "wl_ratio":       wl_ratio,
+            "total_deployed": round(deployed, 2),
+            "net_pnl":        round(pnl, 2),
+            "roi_pct":        roi_pct,
+            "last_seen":      r["last_seen"],
+        })
+    return result
+
+
+async def get_pattern_stats_for_export() -> list[dict[str, Any]]:
+    """Same as get_pattern_stats() but returns all fields needed for XLS export."""
+    return await get_pattern_stats()

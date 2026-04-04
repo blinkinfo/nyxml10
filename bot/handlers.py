@@ -25,6 +25,7 @@ from bot.formatters import (
     format_demo_stats,
     format_error_alert,
     format_help,
+    format_pattern_stats,
     format_recent_signals,
     format_recent_trades,
     format_redeem_preview,
@@ -38,6 +39,7 @@ from bot.keyboards import (
     back_to_menu,
     download_keyboard,
     main_menu,
+    pattern_filter_row,
     redeem_confirm_keyboard,
     redeem_done_keyboard,
     settings_keyboard,
@@ -342,6 +344,53 @@ async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+
+# ---------------------------------------------------------------------------
+# /patterns — per-pattern performance dashboard
+# ---------------------------------------------------------------------------
+
+@auth_check
+async def cmd_patterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = await queries.get_pattern_stats()
+    text = format_pattern_stats(rows)
+    kb = pattern_filter_row()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@auth_check
+async def cmd_download_pattern_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export per-pattern stats as an Excel file."""
+    query = update.callback_query
+    await query.answer("Preparing Excel...")
+    rows = await queries.get_pattern_stats_for_export()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Patterns"
+    ws.append([
+        "pattern", "total_trades", "wins", "losses",
+        "win_pct", "wl_ratio", "total_deployed", "net_pnl", "roi_pct", "last_seen",
+    ])
+    for r in rows:
+        ws.append([
+            r["pattern"], r["total_trades"], r["wins"], r["losses"],
+            r["win_pct"],
+            r["wl_ratio"] if r["wl_ratio"] != float("inf") else "inf",
+            r["total_deployed"], r["net_pnl"], r["roi_pct"], r["last_seen"],
+        ])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    await query.message.reply_document(
+        document=buf,
+        filename="patterns.xlsx",
+        caption="\U0001f4e5 Per-pattern stats export (Excel)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Callback query router
 # ---------------------------------------------------------------------------
@@ -468,6 +517,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "demo_all":
         await _render_demo_stats(update, limit=None, active="all")
+
+    elif data == "cmd_patterns":
+        await cmd_patterns(update, context)
+
+    elif data == "download_pattern_xlsx":
+        await cmd_download_pattern_excel(update, context)
 
     else:
         await query.answer("Unknown action")
@@ -644,6 +699,7 @@ def register(application) -> None:
     application.add_handler(CommandHandler("redeem",      cmd_redeem))
     application.add_handler(CommandHandler("redemptions", cmd_redemptions))
     application.add_handler(CommandHandler("demo",        cmd_demo))
+    application.add_handler(CommandHandler("patterns",   cmd_patterns))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

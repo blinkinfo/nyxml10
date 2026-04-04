@@ -27,6 +27,9 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f9ea Demo", callback_data="cmd_demo"),
             InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
         ],
+        [
+            InlineKeyboardButton("\U0001f522 Patterns", callback_data="cmd_patterns"),
+        ],
     ])
 
 
@@ -165,6 +168,16 @@ def demo_filter_row(active: str = "all") -> InlineKeyboardMarkup:
             _btn("Last 10", "demo_10"),
             _btn("Last 50", "demo_50"),
             _btn("All Time", "demo_all"),
+        ],
+        [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
+def pattern_filter_row() -> InlineKeyboardMarkup:
+    """Keyboard for the /patterns dashboard."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f4e5 Download Excel", callback_data="download_pattern_xlsx"),
         ],
         [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
     ])

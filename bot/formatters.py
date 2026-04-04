@@ -493,6 +493,7 @@ def format_help() -> str:
         "/redemptions \u2014 Redemption history\n"
         "/settings \u2014 Toggle autotrade/auto-redeem, set amount\n"
         "/demo \u2014 Demo trading mode & virtual bankroll\n"
+        "/patterns \u2014 Per-pattern win rate & P&L stats\n"
         "/help \u2014 This help message\n\n"
         "<b>How it works:</b>\n"
         "Every 5 minutes the bot analyses the last six closed BTC-USD "
@@ -549,4 +550,40 @@ def format_demo_recent_trades(trades: list) -> str:
         lines.append(
             f"\U0001f9ea {icon} {ss}-{se} UTC  {t['side']}  ${t['amount_usdc']:.2f}{pnl_str}"
         )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pattern analytics formatter
+# ---------------------------------------------------------------------------
+
+def format_pattern_stats(rows: list[dict[str, Any]]) -> str:
+    """Format per-pattern performance stats as a Telegram HTML message."""
+    SEP = "\u2501" * 20
+    if not rows:
+        return (
+            "\U0001f522 <b>Pattern Performance</b>\n"
+            + SEP + "\n"
+            "No resolved real trades recorded yet.\n"
+            "Pattern stats appear once trades complete."
+        )
+
+    lines = [
+        "\U0001f522 <b>Pattern Performance</b>",
+        SEP,
+    ]
+    for r in rows:
+        wl = f"{r['wl_ratio']}" if r["wl_ratio"] != float("inf") else "\u221e"
+        roi_sign = "+" if r["roi_pct"] >= 0 else ""
+        pnl_sign = "+" if r["net_pnl"] >= 0 else ""
+        lines += [
+            f"\U0001f4cc <b>{r['pattern']}</b>  "
+            f"({r['total_trades']} trades \u2022 last: {str(r['last_seen'])[:16]})",
+            f"   \u2705 {r['wins']}W  \u274c {r['losses']}L  "
+            f"\U0001f4c8 {r['win_pct']}%  W/L: {wl}",
+            f"   \U0001f4b5 ${r['total_deployed']:.2f} deployed  "
+            f"P&L: {pnl_sign}${r['net_pnl']:.2f}  "
+            f"ROI: {roi_sign}{r['roi_pct']}%",
+        ]
+    lines.append(SEP)
     return "\n".join(lines)
