@@ -355,6 +355,8 @@ async def _check_and_trade() -> None:
         from bot.formatters import (
             format_signal,
             format_skip,
+            format_ml_signal,
+            format_ml_skip,
             format_trade_filled,
             format_trade_unmatched,
             format_trade_aborted,
@@ -386,12 +388,23 @@ async def _check_and_trade() -> None:
                 opposite_price=None,
                 skipped=True,
             )
-            msg = format_skip(
-                slot_start_str=slot_start_str,
-                slot_end_str=slot_end_str,
-                reason=signal.get("reason", "No pattern match"),
-                pattern=signal.get("pattern"),
-            )
+            if "ml_p_up" in signal:
+                msg = format_ml_skip(
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    ml_p_up=signal["ml_p_up"],
+                    ml_p_down=signal["ml_p_down"],
+                    ml_up_threshold=signal["ml_up_threshold"],
+                    ml_down_threshold=signal["ml_down_threshold"],
+                    ml_down_enabled=signal["ml_down_enabled"],
+                )
+            else:
+                msg = format_skip(
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    reason=signal.get("reason", "No pattern match"),
+                    pattern=signal.get("pattern"),
+                )
             await _send_telegram(msg)
             return
 
@@ -430,13 +443,25 @@ async def _check_and_trade() -> None:
         )
 
         # 5. Send signal notification
-        msg = format_signal(
-            side=side,
-            entry_price=entry_price,
-            slot_start_str=slot_start_str,
-            slot_end_str=slot_end_str,
-            pattern=pattern,
-        )
+        if "ml_p_up" in signal:
+            msg = format_ml_signal(
+                side=side,
+                entry_price=entry_price,
+                slot_start_str=slot_start_str,
+                slot_end_str=slot_end_str,
+                ml_p_up=signal["ml_p_up"],
+                ml_p_down=signal["ml_p_down"],
+                ml_up_threshold=signal["ml_up_threshold"],
+                ml_down_threshold=signal["ml_down_threshold"],
+            )
+        else:
+            msg = format_signal(
+                side=side,
+                entry_price=entry_price,
+                slot_start_str=slot_start_str,
+                slot_end_str=slot_end_str,
+                pattern=pattern,
+            )
         await _send_telegram(msg)
 
         # 6. Place trade if autotrade on (with robust retry logic)

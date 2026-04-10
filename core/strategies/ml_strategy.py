@@ -268,6 +268,12 @@ class MLStrategy(BaseStrategy):
                         f"Below threshold (p_up={prob:.4f}<{up_threshold:.3f}, "
                         f"{down_reason})"
                     ),
+                    # Structured ML fields for rich Telegram formatting
+                    "ml_p_up": prob,
+                    "ml_p_down": prob_down,
+                    "ml_up_threshold": up_threshold,
+                    "ml_down_threshold": down_threshold,
+                    "ml_down_enabled": down_enabled,
                 }
 
             log.info(
@@ -301,6 +307,12 @@ class MLStrategy(BaseStrategy):
                 "opposite_price": opposite_price,
                 "token_id":       token_id,
                 "pattern":        f"p_up={prob:.4f},p_down={prob_down:.4f}",
+                # Structured ML fields for rich Telegram formatting
+                "ml_p_up":          prob,
+                "ml_p_down":        prob_down,
+                "ml_up_threshold":  up_threshold,
+                "ml_down_threshold": down_threshold,
+                "ml_down_enabled":  down_enabled,
             }
 
         except Exception as exc:

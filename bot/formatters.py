@@ -64,6 +64,88 @@ def format_skip(
     )
 
 
+def format_ml_signal(
+    side: str,
+    entry_price: float,
+    slot_start_str: str,
+    slot_end_str: str,
+    ml_p_up: float,
+    ml_p_down: float,
+    ml_up_threshold: float,
+    ml_down_threshold: float,
+) -> str:
+    """ML signal notification — Option A card with confidence and edge."""
+    side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
+
+    # Determine winning probability and threshold based on direction
+    if side == "Up":
+        win_prob = ml_p_up
+        win_thr  = ml_up_threshold
+        win_arrow = "\u2191"
+        win_label = "UP  "
+        los_arrow = "\u2193"
+        los_label = "DOWN"
+        los_prob  = ml_p_down
+    else:
+        win_prob = ml_p_down
+        win_thr  = ml_down_threshold
+        win_arrow = "\u2193"
+        win_label = "DOWN"
+        los_arrow = "\u2191"
+        los_label = "UP  "
+        los_prob  = ml_p_up
+
+    edge = round((win_prob - win_thr) * 100, 1)
+    edge_str = f"+{edge:.1f}%"
+
+    return (
+        "\U0001f4e1 <b>Signal Fired!</b>  \U0001f916 ML\n"
+        "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u2502 \u23f0 Slot:  {slot_start_str} \u2013 {slot_end_str} UTC\n"
+        f"\u2502 {side_emoji} Side:  {side}\n"
+        f"\u2502 \U0001f4b2 Price: ${entry_price:.2f}\n"
+        "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "\u2502 \U0001f9e0 ML Confidence\n"
+        f"\u2502  {win_arrow} {win_label}   {win_prob*100:.1f}%  \u2705  edge {edge_str}\n"
+        f"\u2502  {los_arrow} {los_label}   {los_prob*100:.1f}%\n"
+        f"\u2502  Threshold: \u2265 {win_thr*100:.1f}%\n"
+        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    )
+
+
+def format_ml_skip(
+    slot_start_str: str,
+    slot_end_str: str,
+    ml_p_up: float,
+    ml_p_down: float,
+    ml_up_threshold: float,
+    ml_down_threshold: float,
+    ml_down_enabled: bool,
+) -> str:
+    """ML no-signal notification — Option C card with shortfall or disabled status."""
+    up_short   = round((ml_up_threshold - ml_p_up) * 100, 1)
+    down_short = round((ml_down_threshold - ml_p_down) * 100, 1)
+
+    up_note   = f"short \u2212{up_short:.1f}%"
+
+    if ml_down_enabled:
+        down_note = f"short \u2212{down_short:.1f}%"
+    else:
+        down_note = "disabled"
+
+    return (
+        "\u23ed\ufe0f <b>No Signal</b>  \U0001f916 ML\n"
+        "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u2502 \u23f0 Slot:  {slot_start_str} \u2013 {slot_end_str} UTC\n"
+        "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "\u2502 \U0001f9e0 ML Output\n"
+        f"\u2502  \u2715 UP    {ml_p_up*100:.1f}%   {up_note}\n"
+        f"\u2502  \u2715 DOWN  {ml_p_down*100:.1f}%   {down_note}\n"
+        f"\u2502  Threshold \u2265 {ml_up_threshold*100:.1f}%\n"
+        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    )
+
+
 def format_signal_resolution(
     is_win: bool,
     side: str,
