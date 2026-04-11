@@ -52,6 +52,15 @@ LGBM_PARAMS = {
 NUM_BOOST_ROUND = 1000
 EARLY_STOPPING_ROUNDS = 50
 
+# ---------------------------------------------------------------------------
+# Walk-forward validation constants
+# ---------------------------------------------------------------------------
+WF_FOLDS = 5          # number of walk-forward folds
+WF_INITIAL_PCT = 0.60 # fraction of data used as train+val in fold 1
+# Each fold expands the train+val window by WF_STEP_PCT.
+# WF_STEP_PCT = (1.0 - WF_INITIAL_PCT) / WF_FOLDS = 0.08
+WF_STEP_PCT = (1.0 - WF_INITIAL_PCT) / WF_FOLDS
+
 
 # ---------------------------------------------------------------------------
 # Threshold sweep (val set only — never test set)
@@ -100,8 +109,8 @@ def sweep_threshold(
         # Pick maximum daily edge = (WR - 0.5) * trades_per_day among WR >= 0.59 candidates.
         # This balances win-rate quality against trade frequency rather than
         # blindly picking the highest WR or the most trades.
-        # Example: 59.5% WR / 5 tpd → edge = (0.595-0.5)*5 = 0.475, which beats
-        # 65% WR / 2 tpd → edge = (0.65-0.5)*2 = 0.30, even though 65% WR > 59.5%.
+        # Example: 59.5% WR / 5 tpd -> edge = (0.595-0.5)*5 = 0.475, which beats
+        # 65% WR / 2 tpd -> edge = (0.65-0.5)*2 = 0.30, even though 65% WR > 59.5%.
         # The metric correctly favours the more active threshold here.
         best = max(candidates_above, key=lambda x: (x[1] - 0.5) * x[3])
         best_threshold, best_wr, best_trades, best_trades_per_day = best
@@ -188,6 +197,165 @@ def evaluate_at_threshold(
 
 
 # ---------------------------------------------------------------------------
+# Walk-forward validation (evaluation only — does NOT save any model)
+# ---------------------------------------------------------------------------
+
+def walk_forward_validation(X: np.ndarray, y: np.ndarray) -> dict:
+    """Run 5-fold walk-forward validation on the full dataset.
+
+    Each fold uses an expanding training window:
+      Fold 1: train+val = first 60%, test = next 8%  (rows [0:60%], test [60%:68%])
+      Fold 2: train+val = first 68%, test = next 8%
+      Fold 3: train+val = first 76%, test = next 8%
+      Fold 4: train+val = first 84%, test = next 8%
+      Fold 5: train+val = first 92%, test = last 8%  (remainder goes to last fold)
+
+    Within each fold, the train+val block is further split 80/20 (train/val)
+    and the same threshold sweep used in the main training path is applied to
+    the val set. The resulting threshold is then used to evaluate WR on the
+    held-out test window, which was never seen during training or threshold
+    selection.
+
+    This is PURELY for reporting. No model is saved here.
+
+    Returns:
+        dict with keys:
+          fold_results  -- list of per-fold dicts (fold, train_size, val_size,
+                           test_size, threshold, val_wr, test_wr, test_trades)
+          avg_wr        -- mean test WR across all folds
+          std_wr        -- std dev of test WR across all folds
+          min_wr        -- minimum per-fold test WR
+          max_wr        -- maximum per-fold test WR
+    """
+    n = len(y)
+    fold_results = []
+
+    log.info(
+        "walk_forward_validation: starting %d-fold walk-forward on n=%d samples "
+        "(initial_pct=%.0f%%, step_pct=%.0f%%)",
+        WF_FOLDS, n, WF_INITIAL_PCT * 100, WF_STEP_PCT * 100,
+    )
+
+    for fold_idx in range(WF_FOLDS):
+        # ---------------------------------------------------------------------------
+        # Compute slice boundaries — all in absolute row indices.
+        # train+val window expands by WF_STEP_PCT each fold.
+        # test window is always the NEXT sequential chunk after train+val.
+        # No row ever appears in both train+val and test for the same fold.
+        # ---------------------------------------------------------------------------
+        trainval_end = int(n * (WF_INITIAL_PCT + fold_idx * WF_STEP_PCT))
+        if fold_idx < WF_FOLDS - 1:
+            test_end = int(n * (WF_INITIAL_PCT + (fold_idx + 1) * WF_STEP_PCT))
+        else:
+            test_end = n  # last fold uses all remaining rows
+
+        test_start = trainval_end  # test immediately follows train+val — no gap, no overlap
+
+        # 80/20 split of the train+val block (same ratio as main training path)
+        fold_val_start = int(trainval_end * 0.80)
+
+        # Slice arrays — time order is strictly preserved (no shuffling)
+        X_fold_train = X[:fold_val_start]
+        y_fold_train = y[:fold_val_start]
+        X_fold_val = X[fold_val_start:trainval_end]
+        y_fold_val = y[fold_val_start:trainval_end]
+        X_fold_test = X[test_start:test_end]
+        y_fold_test = y[test_start:test_end]
+
+        fold_num = fold_idx + 1
+        log.info(
+            "walk_forward fold %d/%d: train=[0:%d] val=[%d:%d] test=[%d:%d]",
+            fold_num, WF_FOLDS,
+            fold_val_start, fold_val_start, trainval_end,
+            test_start, test_end,
+        )
+
+        if len(X_fold_train) < 50 or len(X_fold_val) < 10 or len(X_fold_test) < 10:
+            log.warning(
+                "walk_forward fold %d: insufficient samples "
+                "(train=%d val=%d test=%d) — skipping fold",
+                fold_num, len(X_fold_train), len(X_fold_val), len(X_fold_test),
+            )
+            continue
+
+        # Train a fold model (evaluation only — not saved to disk)
+        fold_train_data = lgb.Dataset(X_fold_train, label=y_fold_train, feature_name=FEATURE_COLS)
+        fold_val_data = lgb.Dataset(
+            X_fold_val, label=y_fold_val, feature_name=FEATURE_COLS, reference=fold_train_data
+        )
+        fold_callbacks = [
+            lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
+            lgb.log_evaluation(period=0),  # suppress per-iteration logging for fold models
+        ]
+        fold_model = lgb.train(
+            LGBM_PARAMS,
+            fold_train_data,
+            num_boost_round=NUM_BOOST_ROUND,
+            valid_sets=[fold_val_data],
+            callbacks=fold_callbacks,
+        )
+
+        # Threshold sweep on fold val set (same logic as main training path)
+        fold_val_probs = fold_model.predict(X_fold_val)
+        fold_threshold, fold_val_wr, fold_val_tpd = sweep_threshold(fold_val_probs, y_fold_val)
+
+        # Evaluate on strictly held-out test window using threshold from val
+        fold_test_probs = fold_model.predict(X_fold_test)
+        fold_test_metrics = evaluate_at_threshold(fold_test_probs, y_fold_test, fold_threshold)
+
+        log.info(
+            "walk_forward fold %d/%d: threshold=%.3f val_wr=%.4f "
+            "test_wr=%.4f test_trades=%d",
+            fold_num, WF_FOLDS,
+            fold_threshold, fold_val_wr,
+            fold_test_metrics["wr"], fold_test_metrics["trades"],
+        )
+
+        fold_results.append({
+            "fold": fold_num,
+            "train_size": fold_val_start,
+            "val_size": trainval_end - fold_val_start,
+            "test_size": test_end - test_start,
+            "threshold": fold_threshold,
+            "val_wr": fold_val_wr,
+            "test_wr": fold_test_metrics["wr"],
+            "test_trades": fold_test_metrics["trades"],
+            "test_trades_per_day": fold_test_metrics["trades_per_day"],
+        })
+
+    # Aggregate results
+    if fold_results:
+        wrs = [r["test_wr"] for r in fold_results]
+        avg_wr = float(np.mean(wrs))
+        std_wr = float(np.std(wrs))
+        min_wr = float(np.min(wrs))
+        max_wr = float(np.max(wrs))
+    else:
+        avg_wr = std_wr = min_wr = max_wr = 0.0
+
+    log.info(
+        "walk_forward_validation SUMMARY: folds=%d avg_wr=%.4f std_wr=%.4f "
+        "min_wr=%.4f max_wr=%.4f",
+        len(fold_results), avg_wr, std_wr, min_wr, max_wr,
+    )
+    for r in fold_results:
+        log.info(
+            "  fold %d: train_size=%d val_size=%d test_size=%d "
+            "thresh=%.3f val_wr=%.4f test_wr=%.4f test_trades=%d",
+            r["fold"], r["train_size"], r["val_size"], r["test_size"],
+            r["threshold"], r["val_wr"], r["test_wr"], r["test_trades"],
+        )
+
+    return {
+        "fold_results": fold_results,
+        "avg_wr": avg_wr,
+        "std_wr": std_wr,
+        "min_wr": min_wr,
+        "max_wr": max_wr,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -199,24 +367,41 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         slot: 'current' or 'candidate'
 
     Returns:
-        dict with model, threshold, test_metrics, val_wr, val_trades
+        dict with model, threshold, val_wr, val_trades, wf_results, and metadata
     """
     n = len(df_features)
     if n < 100:
         raise ValueError(f"Too few samples to train: {n}")
 
+    X = df_features[FEATURE_COLS].values
+    y = df_features["target"].values
+
+    # ---------------------------------------------------------------------------
+    # Walk-forward validation — purely for evaluation/reporting.
+    # Runs BEFORE the final model fit so results are logged early.
+    # Does NOT save any model to disk. Does NOT influence the final threshold.
+    # ---------------------------------------------------------------------------
+    log.info("train: running walk-forward validation (%d folds) before final fit", WF_FOLDS)
+    wf_results = walk_forward_validation(X, y)
+    log.info(
+        "train: walk-forward done — avg_wr=%.4f std_wr=%.4f (across %d folds)",
+        wf_results["avg_wr"], wf_results["std_wr"], len(wf_results["fold_results"]),
+    )
+
+    # ---------------------------------------------------------------------------
+    # Final model: train on ALL data using the same 80/20 val split for early
+    # stopping, then sweep threshold on that val set.
+    #
     # Time-series split: DO NOT SHUFFLE
     # split_boundary = index where validation ends and test begins (75% of data).
     # val_start      = index where training ends and validation begins (80% of split_boundary).
     # Layout: [0 : val_start] = train, [val_start : split_boundary] = val, [split_boundary :] = test
+    # ---------------------------------------------------------------------------
     split_boundary = int(n * 0.75)
     val_start = int(split_boundary * 0.80)
 
     log.info("train: n=%d train=[0:%d] val=[%d:%d] test=[%d:%d]",
              n, val_start, val_start, split_boundary, split_boundary, n)
-
-    X = df_features[FEATURE_COLS].values
-    y = df_features["target"].values
 
     X_train, y_train = X[:val_start], y[:val_start]
     X_val, y_val = X[val_start:split_boundary], y[val_start:split_boundary]
@@ -337,6 +522,13 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "down_test_wr": down_test_metrics["wr"],
         "down_test_trades": down_test_metrics["trades"],
         "down_test_tpd": down_test_metrics["trades_per_day"],
+        # Walk-forward validation summary
+        "wf_avg_wr": wf_results["avg_wr"],
+        "wf_std_wr": wf_results["std_wr"],
+        "wf_min_wr": wf_results["min_wr"],
+        "wf_max_wr": wf_results["max_wr"],
+        "wf_folds": len(wf_results["fold_results"]),
+        "wf_fold_results": wf_results["fold_results"],
         # Common
         "sample_count": n,
         "train_size": val_start,
@@ -361,6 +553,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "val_trades": best_trades_per_day,
         "best_iteration": model.best_iteration,
         "blocked": blocked,
+        "wf_results": wf_results,
         "warning_reason": (
             f"Test WR {test_metrics['wr']*100:.2f}% is below the 59% deployment gate "
             f"(Blueprint Rule 10). Candidate saved but NOT auto-promoted."
