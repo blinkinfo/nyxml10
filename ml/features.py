@@ -3,6 +3,10 @@
 ZERO lookahead bias: all features use shift(k>=1). Target uses shift(-1) (future,
 only for training labels — never used as a feature).
 
+Target semantics: 1 if the NEXT candle closes at or above its own open
+(close[i+1] >= open[i+1]), matching Polymarket's settlement logic
+(resolver.py: winner = "Up" if close_price >= open_price else "Down").
+
 26 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
 funding (2), CVD (5), time-of-day (2), volatility regime (2).
 """
@@ -264,9 +268,11 @@ def build_features(
     df5["vol_regime"] = (atr_shifted - atr_roll_mean) / atr_roll_std.clip(lower=1e-10)
 
     # -----------------------------------------------------------------------
-    # Target: 1 if close[i+1] > close[i] (future label, NOT a feature)
+    # Target: 1 if next candle closes >= its own open (future label, NOT a feature)
+    # Matches Polymarket settlement: close >= open within candle i+1
+    # (resolver.py: winner = "Up" if close_price >= open_price else "Down")
     # -----------------------------------------------------------------------
-    df5["target"] = (df5["close"].shift(-1) > df5["close"]).astype(int)
+    df5["target"] = (df5["close"].shift(-1) >= df5["open"].shift(-1)).astype(int)
 
     # -----------------------------------------------------------------------
     # Drop rows with any NaN in features or target, return feature cols + target
