@@ -16,6 +16,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 
 from ml import model_store
 from ml.features import FEATURE_COLS
+from config import ML_PAYOUT_RATIO
 
 # ---------------------------------------------------------------------------
 # Deployment gate — Blueprint Rule 10
@@ -73,39 +74,82 @@ WF_STEP_PCT = (1.0 - WF_INITIAL_PCT) / WF_FOLDS
 # thresholds on typical val-set sizes.
 MIN_TRADES = 30
 
+def _ev_per_day(wr: float, tpd: float, payout: float) -> float:
+    """Compute payout-adjusted expected value per day.
+
+    For a $1 flat-bet with asymmetric payout:
+      EV/trade = (WR * payout) - ((1 - WR) * 1.0)
+               = WR * (1 + payout) - 1.0
+
+    EV/day = EV/trade * trades_per_day
+
+    This is the correct optimisation target when payout != 1.0.
+    At payout=1.0 this reduces to (WR - 0.5) * tpd * 2, preserving
+    the original ranking direction when payout was symmetric.
+
+    Args:
+        wr: Win rate (0.0 - 1.0)
+        tpd: Trades per day
+        payout: Profit per $1 wagered on a winning trade (e.g. 0.85)
+
+    Returns:
+        Expected dollar profit per day per $1 stake.
+    """
+    return (wr * (1.0 + payout) - 1.0) * tpd
+
+
 def sweep_threshold(
     probs: np.ndarray,
     y_true: np.ndarray,
     lo: float = 0.50,
     hi: float = 0.80,
     step: float = 0.02,
+    payout: float = ML_PAYOUT_RATIO,
 ) -> tuple[float, float, float]:
     """Sweep thresholds on val set and select best.
 
     Selection criteria:
-      - Thresholds with fewer than MIN_TRADES trades are skipped — the WR
+      - Thresholds with fewer than MIN_TRADES trades are skipped -- the WR
         estimate is too noisy to be meaningful on small samples.
       - If any remaining threshold achieves WR >= 0.58: pick the one that
-        maximizes (WR - 0.5) * trades_per_day  (edge-weighted activity score).
-      - Otherwise: pick threshold with maximum WR (among those >= MIN_TRADES).
+        maximizes payout-adjusted EV/day = (WR * (1 + payout) - 1.0) * tpd.
+        This correctly accounts for asymmetric payouts (e.g. win $0.85,
+        lose $1.00) rather than assuming a 1:1 payout.
+      - Otherwise: pick threshold with maximum payout-adjusted EV/day
+        among those >= MIN_TRADES (fallback, with warning logged).
+
+    Why payout-adjusted EV?
+      The legacy metric (WR - 0.5) * tpd implicitly assumed breakeven at
+      50% WR (valid only at 1:1 payout). With a 0.85 payout, real breakeven
+      is 54.05% WR. Using raw (WR - 0.5) can rank a lower-WR, higher-volume
+      threshold above a genuinely more profitable one. The corrected metric
+      uses actual dollar EV so the selected threshold always maximises
+      real daily profit.
 
     Step is intentionally coarse (0.02) to reduce overfitting on small val
     slices.  Fine steps (e.g. 0.005) produce 61 candidates on a small slice
     and reliably find a lucky threshold; 0.02 gives 16 candidates while still
-    covering the full 0.50–0.80 range.
+    covering the full 0.50-0.80 range.
+
+    Args:
+        probs: Model output probabilities for the validation set.
+        y_true: True binary labels for the validation set.
+        lo: Lower bound of threshold sweep range.
+        hi: Upper bound of threshold sweep range.
+        step: Step size for sweep (coarse by design).
+        payout: Profit per $1 wagered on a win (default: ML_PAYOUT_RATIO
+                from config, overridable via ML_PAYOUT_RATIO env var).
 
     Returns:
       (best_threshold, best_wr, trades_per_day)
       trades_per_day = trades / (len(probs) * 5 / 1440)
     """
-    periods_per_day = 1440 / 5  # 5-min candles per day
-
     best_threshold = lo
     best_wr = 0.0
     best_trades = 0
     best_trades_per_day = 0.0
 
-    # First pass: find candidates with WR >= 0.58 AND trades >= MIN_TRADES
+    # First pass: collect candidates with WR >= 0.58 AND trades >= MIN_TRADES
     candidates_above = []
 
     thresh = lo
@@ -120,25 +164,28 @@ def sweep_threshold(
         thresh = round(thresh + step, 4)
 
     if candidates_above:
-        # Pick maximum daily edge = (WR - 0.5) * trades_per_day among WR >= 0.58 candidates.
-        # This balances win-rate quality against trade frequency rather than
-        # blindly picking the highest WR or the most trades.
-        # Example: 59.5% WR / 5 tpd -> edge = (0.595-0.5)*5 = 0.475, which beats
-        # 65% WR / 2 tpd -> edge = (0.65-0.5)*2 = 0.30, even though 65% WR > 59.5%.
-        # The metric correctly favours the more active threshold here.
-        best = max(candidates_above, key=lambda x: (x[1] - 0.5) * x[3])
+        # Pick the threshold with the highest payout-adjusted EV/day.
+        # EV/day = (WR * (1 + payout) - 1.0) * trades_per_day
+        # This correctly accounts for asymmetric win/loss payouts and ranks
+        # thresholds by real dollar profitability.
+        # Example at payout=0.85:
+        #   thresh=0.60: WR=64%, tpd=56  -> EV/day = (0.64*1.85-1.0)*56 = 0.184*56 = 10.30
+        #   thresh=0.53: WR=58.2%, tpd=122 -> EV/day = (0.582*1.85-1.0)*122 = 0.077*122 = 9.36
+        #   -> thresh=0.60 wins (correctly -- it earns more dollars per day)
+        best = max(candidates_above, key=lambda x: _ev_per_day(x[1], x[3], payout))
         best_threshold, best_wr, best_trades, best_trades_per_day = best
         log.info(
-            "sweep_threshold: WR>=0.58 candidates=%d, best thresh=%.3f WR=%.4f "
-            "trades/day=%.1f edge/day=%.4f",
-            len(candidates_above), best_threshold, best_wr, best_trades_per_day,
-            (best_wr - 0.5) * best_trades_per_day,
+            "sweep_threshold: WR>=0.58 candidates=%d, payout=%.2f, "
+            "best thresh=%.3f WR=%.4f trades/day=%.1f ev/day=%.4f",
+            len(candidates_above), payout,
+            best_threshold, best_wr, best_trades_per_day,
+            _ev_per_day(best_wr, best_trades_per_day, payout),
         )
     else:
-        # No candidate >= 0.58 with enough trades: pick max WR among those >= MIN_TRADES.
-        # Fall back to lo with trades=0 only if no threshold meets the MIN_TRADES floor
-        # (e.g. extremely small val slice — should not happen in normal operation).
-        best_wr_val = 0.0
+        # No candidate >= 0.58 with enough trades: fall back to the threshold
+        # with the highest payout-adjusted EV/day among those >= MIN_TRADES.
+        # More correct than raw max-WR since it accounts for the real payout.
+        best_ev = float("-inf")
         thresh = lo
         while thresh <= hi + 1e-9:
             mask = probs >= thresh
@@ -146,16 +193,19 @@ def sweep_threshold(
             if trades >= MIN_TRADES:
                 wr = float(y_true[mask].mean())
                 tpd = trades / (len(probs) * 5 / 1440)
-                if wr > best_wr_val or (wr == best_wr_val and trades > best_trades):
-                    best_wr_val = wr
+                ev = _ev_per_day(wr, tpd, payout)
+                if ev > best_ev:
+                    best_ev = ev
                     best_threshold = thresh
                     best_wr = wr
                     best_trades = trades
                     best_trades_per_day = tpd
             thresh = round(thresh + step, 4)
         log.warning(
-            "sweep_threshold: no threshold achieves WR>=0.58 (min_trades=%d), best=%.3f WR=%.4f",
-            MIN_TRADES, best_threshold, best_wr,
+            "sweep_threshold: no threshold achieves WR>=0.58 (min_trades=%d), "
+            "payout=%.2f, best=%.3f WR=%.4f ev/day=%.4f",
+            MIN_TRADES, payout, best_threshold, best_wr,
+            _ev_per_day(best_wr, best_trades_per_day, payout),
         )
 
     return best_threshold, best_wr, best_trades_per_day
