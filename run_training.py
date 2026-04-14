@@ -23,7 +23,6 @@ print(f'Trades/day: {result["test_metrics"]["trades_per_day"]:.1f}')
 print(f'Sample count: {result["test_metrics"]}')
 print(f'Model saved: {model_store.has_model("current")}')
 
-import lightgbm as lgb
 model = result['model']
 fi = dict(zip(feat_eng.FEATURE_COLS, model.feature_importance(importance_type='gain')))
 top = sorted(fi.items(), key=lambda x: -x[1])[:10]

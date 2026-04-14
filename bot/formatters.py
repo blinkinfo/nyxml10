@@ -736,8 +736,8 @@ def format_model_status(slot: str, meta: dict, threshold: float) -> str:
         )
     else:
         down_section = (
-            f"\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
-            f"\u2502   Not validated\n"
+            "\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
+            "\u2502   Not validated\n"
         )
 
     return (
@@ -848,8 +848,8 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
         )
     else:
         down_section = (
-            f"\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
-            f"\u2502   Not validated\n"
+            "\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
+            "\u2502   Not validated\n"
         )
 
     return (
@@ -915,8 +915,8 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
         )
     else:
         down_section = (
-            f"\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
-            f"\u2502   Not validated\n"
+            "\u2502 \u2193 DOWN Side              \u26d4 DISABLED\n"
+            "\u2502   Not validated\n"
         )
 
     return (

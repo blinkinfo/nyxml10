@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any
+
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -14,7 +14,7 @@ from core import strategy, trader, resolver
 from core import pending_queue
 from db import queries
 import html as _html
-from polymarket.markets import SLOT_DURATION, slot_info_from_ts
+from polymarket.markets import SLOT_DURATION
 
 log = logging.getLogger(__name__)
 
@@ -435,7 +435,7 @@ async def _check_and_trade() -> None:
 
         # 3. TradeManager passthrough (filters removed — always allowed)
         demo_trade_enabled = await queries.is_demo_trade_enabled()
-        filter_result = await TradeManager.check(
+        _filter_result = await TradeManager.check(
             signal_side=side,
             current_slot_ts=slot_ts,
             is_demo=demo_trade_enabled,

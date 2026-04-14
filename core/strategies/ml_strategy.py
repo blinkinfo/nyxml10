@@ -12,7 +12,6 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
-import numpy as np
 
 from core.strategies.base import BaseStrategy
 from ml import data_fetcher

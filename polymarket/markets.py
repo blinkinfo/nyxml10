@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx

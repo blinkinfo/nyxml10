@@ -128,7 +128,7 @@ def _print_table(m: dict) -> None:
     if m.get("confusion_matrix"):
         cm = m["confusion_matrix"]
         if len(cm) == 2 and len(cm[0]) == 2:
-            print(f"  Confusion matrix   :")
+            print("  Confusion matrix   :")
             print(f"    TN={cm[0][0]}  FP={cm[0][1]}")
             print(f"    FN={cm[1][0]}  TP={cm[1][1]}")
     print("=" * 52 + "\n")

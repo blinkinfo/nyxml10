@@ -198,7 +198,7 @@ def sweep_threshold(
                     best_ev = ev
                     best_threshold = thresh
                     best_wr = wr
-                    best_trades = trades
+                    _best_trades = trades
                     best_trades_per_day = tpd
             thresh = round(thresh + step, 4)
         log.warning(

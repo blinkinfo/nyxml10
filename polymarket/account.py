@@ -18,8 +18,6 @@ from typing import Any
 
 import httpx
 
-import config as cfg
-
 log = logging.getLogger(__name__)
 
 # USDC uses 6 decimal places on Polygon

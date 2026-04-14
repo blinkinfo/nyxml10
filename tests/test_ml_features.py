@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import pandas as pd
 import sys
@@ -288,7 +287,6 @@ def test_fetch_funding_mock():
     # Define a 10-day window (start to end) — funding every 8h = 30 records expected
     # Use a window far enough back that coverage from ccxt (which returns only 3 recent
     # records) will be < 80%, forcing the REST fallback.
-    import time as _time
     now_ms = 1_700_000_000_000  # fixed epoch for determinism (~Nov 2023)
     start_ms = now_ms - 10 * 24 * 3600 * 1000   # 10 days before
     end_ms   = now_ms

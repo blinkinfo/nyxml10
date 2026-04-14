@@ -162,7 +162,9 @@ def delete_model(slot: str) -> None:
 
 async def save_model_to_db(model: lgb.Booster, slot: str, metadata: dict) -> None:
     """Serialize model to bytes and upsert into model_blobs table in SQLite."""
-    import tempfile, os, json
+    import tempfile
+    import os
+    import json
     import aiosqlite
     import config as cfg
     with tempfile.NamedTemporaryFile(suffix=".lgb", delete=False) as tmp:
@@ -215,7 +217,8 @@ def patch_metadata(slot: str, updates: dict) -> None:
 
 async def load_model_from_db(slot: str = "current") -> "lgb.Booster | None":
     """Load model blob from SQLite and write to temp disk path for LightGBM to load."""
-    import tempfile, os
+    import tempfile
+    import os
     import aiosqlite
     import config as cfg
     async with aiosqlite.connect(cfg.DB_PATH) as db:

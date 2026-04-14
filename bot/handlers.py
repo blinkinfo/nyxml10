@@ -25,7 +25,6 @@ import config as cfg
 from bot.formatters import (
     format_demo_recent_trades,
     format_demo_stats,
-    format_error_alert,
     format_help,
     format_model_compare,
     format_model_status,
@@ -37,7 +36,6 @@ from bot.formatters import (
     format_redemption_history,
     format_retrain_blocked,
     format_retrain_complete,
-    format_retrain_started,
     format_set_threshold,
     format_set_down_threshold,
     format_signal_stats,
@@ -47,10 +45,8 @@ from bot.formatters import (
 from bot.keyboards import (
     back_to_menu,
     down_override_keyboard,
-    download_keyboard,
     main_menu,
     ml_menu,
-    pattern_filter_row,
     pattern_keyboard,
     redeem_confirm_keyboard,
     redeem_done_keyboard,
