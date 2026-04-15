@@ -396,6 +396,111 @@ def test_fetch_funding_mock():
     )
 
 
+def test_cvd_live_uses_n1_not_n2():
+    """CVD features in live inference must use the N-1 closed candle, not N-2.
+
+    Root cause of the bug this test guards against:
+      ml_strategy.py trims cvd_live with .iloc[:-1] before calling
+      build_live_features(), so the last row of the CVD array passed in is
+      already the N-1 closed candle.  The correct index is therefore
+      len(cvd) - 1, NOT len(cvd) - 2 (which would be N-2, one period stale).
+
+    This test constructs a CVD array where every row has a unique, easily
+    identifiable delta_ratio value.  It then calls build_live_features with
+    the array pre-trimmed (simulating ml_strategy.py) and asserts that the
+    returned delta_ratio equals the value at the LAST row of the trimmed array
+    (N-1), not the second-to-last (N-2).
+    """
+    from collections import deque
+    from ml.features import build_live_features, FEATURE_COLS
+
+    rng = np.random.default_rng(99)
+    n = 250  # 250 × 5min = ~20h; gives 20 × 1h candles (>14 ATR warmup) and sufficient rolling depth
+
+    ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    close = 50000 + np.cumsum(rng.normal(0, 20, n))
+    open_ = close + rng.normal(0, 5, n)
+    high  = np.maximum(open_, close) + rng.uniform(0, 8, n)
+    low   = np.minimum(open_, close) - rng.uniform(0, 8, n)
+    vol   = rng.uniform(50, 200, n)
+
+    df5 = pd.DataFrame({"timestamp": ts, "open": open_, "high": high,
+                        "low": low, "close": close, "volume": vol})
+
+    # 15m / 1h — resampled from df5 so timestamps are aligned
+    s = df5.set_index("timestamp")
+    df15 = s.resample("15min").agg({"open":"first","high":"max","low":"min",
+                                    "close":"last","volume":"sum"}).dropna().reset_index()
+    df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min",
+                                  "close":"last","volume":"sum"}).dropna().reset_index()
+
+    # Funding
+    funding_ts = pd.date_range(ts.min() - pd.Timedelta("16h"), ts.max(), freq="8h", tz="UTC")
+    funding_rates = rng.normal(0, 0.0001, len(funding_ts))
+    funding_buf = deque(funding_rates[-24:].tolist(), maxlen=24)
+    funding_rate_float = float(funding_rates[-1])
+
+    # CVD — assign buy_vol so that delta_ratio_raw is a unique sentinel per row.
+    # Row k gets buy_vol = k+1, sell_vol = 1  =>  delta_ratio_raw = (k+1)/(k+2).
+    # This makes each row's delta_ratio fingerprint trivially distinguishable.
+    k = np.arange(n, dtype=float)
+    buy_vol  = k + 1.0
+    sell_vol = np.ones(n)
+    cvd_full = pd.DataFrame({"timestamp": ts, "open": open_, "high": high,
+                              "low": low, "close": close, "volume": vol,
+                              "buy_vol": buy_vol, "sell_vol": sell_vol})
+
+    # -----------------------------------------------------------------------
+    # Simulate what ml_strategy.py does: drop the still-forming candle.
+    # After trimming, cvd_trimmed has len = n-1.
+    #   cvd_trimmed[-1] = original row n-2 = candle N   (last closed)
+    #   cvd_trimmed[-2] = original row n-3 = candle N-1  ← training parity target
+    #   cvd_trimmed[-3] = original row n-4 = candle N-2
+    #
+    # Training parity (verified numerically):
+    #   build_features: rcvd = _asof_backward(df5.ts, cvd, cols) then shift(1)
+    #   train_feat.iloc[-2] corresponds to df5 row n-2.
+    #   shift(1) at row n-2 gives rcvd.iloc[n-3] = CVD row n-3 in original array.
+    #   In cvd_trimmed (len=n-1): row n-3 = index (n-1)-2 = len(cvd_trimmed)-2.
+    #   Therefore the correct index is len(cvd) - 2.
+    # -----------------------------------------------------------------------
+    cvd_trimmed = cvd_full.iloc[:-1].copy().reset_index(drop=True)  # len = n-1
+    df5_trimmed = df5.iloc[:-1].copy().reset_index(drop=True)       # same trim for 5m
+
+    live_row, nan_features = build_live_features(
+        df5_trimmed, df15, df1h,
+        funding_rate_float, funding_buf,
+        cvd_trimmed,
+    )
+
+    assert live_row is not None, f"build_live_features returned None; nan_features={nan_features}"
+    assert nan_features == [], f"Unexpected NaN features: {nan_features}"
+
+    # CVD sentinel fingerprints:
+    # Row k in cvd_full has buy_vol = k+1, sell_vol = 1
+    # delta_ratio_raw = (k+1) / ((k+1) + 1) = (k+1) / (k+2)
+    #
+    # cvd_trimmed has len = n-1.
+    # Correct idx = len(cvd_trimmed) - 2 = n-3  →  original row n-3
+    # buy_vol at row n-3 = (n-3)+1 = n-2, delta_ratio = (n-2)/(n-1)
+    expected_delta_ratio = (n - 2) / (n - 1)   # fingerprint of len-2 row (training parity)
+
+    # Wrong values for regression detection:
+    wrong_len1 = (n - 1) / n          # len-1: candle N (too fresh by 1)
+    wrong_len3 = (n - 3) / (n - 2)   # len-3: candle N-2 (too stale by 1)
+
+    delta_ratio_idx = FEATURE_COLS.index("delta_ratio")
+    got = float(live_row[0][delta_ratio_idx])
+
+    assert abs(got - expected_delta_ratio) < 1e-10, (
+        f"delta_ratio mismatch: got {got:.10f}, "
+        f"expected (training parity, len-2) {expected_delta_ratio:.10f}. "
+        f"If got≈{wrong_len1:.10f} → reading len-1 (candle N, too fresh). "
+        f"If got≈{wrong_len3:.10f} → reading len-3 (candle N-2, too stale). "
+        f"Correct index is len(cvd)-2."
+    )
+
+
 def test_volume_ratio_n1_excludes_self_from_mean():
     """volume_ratio_n1 = volume[i-1] / mean(volume[i-2]..volume[i-21]).
     The N-1 candle must NOT appear in its own rolling mean denominator.

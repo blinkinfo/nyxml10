@@ -445,7 +445,27 @@ def build_live_features(
         cvd["cvd_20_raw"] = cvd["delta"].rolling(20).sum() / atr_cvd
         cvd["cvd_trend_raw"] = cvd["cvd_5_raw"] - cvd["cvd_20_raw"]
 
-        # Use N-2 (shift 1 from last row)
+        # CVD index parity with training — use len(cvd) - 2.
+        #
+        # TRAINING PATH (build_features):
+        #   rcvd = _asof_backward(df5["timestamp"], cvd, cols)
+        #     → same-grid merge: rcvd.iloc[i] = CVD row at df5.timestamp[i]
+        #   df5["delta_ratio"] = rcvd["delta_ratio_raw"].shift(1)
+        #     → prediction row i uses rcvd.iloc[i-1] = CVD row i-1
+        #   train_feat.iloc[-2] corresponds to df5 row (n-2), so shift(1)
+        #   gives rcvd.iloc[n-3] where n = len(df5).  With df5 having n5=450
+        #   rows, that is rcvd.iloc[447] = CVD row 447 in the original array.
+        #
+        # LIVE PATH (build_live_features):
+        #   ml_strategy.py trims both df5 and cvd_live with .iloc[:-1] before
+        #   calling this function, dropping the still-forming candle.
+        #   After trimming: len(cvd) = original_len - 1.
+        #   The last complete prediction row in live corresponds to
+        #   df5[-2] (N-1).  Training's shift(1) at that row gives CVD row N-2
+        #   in the original array, which is index len(cvd_trimmed) - 2 = len(cvd) - 2.
+        #
+        #   Verified numerically: cvd_trimmed.iloc[len-2] matches training's
+        #   desired CVD values exactly for all 5 CVD features.
         idx_cvd = len(cvd) - 2
         if idx_cvd >= 0:
             delta_ratio = cvd["delta_ratio_raw"].iloc[idx_cvd]
