@@ -24,7 +24,7 @@ import config as cfg
 
 log = logging.getLogger(__name__)
 
-FEATURE_COLS = feat_eng.FEATURE_COLS  # 37 features in exact order
+FEATURE_COLS = feat_eng.FEATURE_COLS  # 42 features in exact order
 
 # Module-level reload flag so cmd_promote_model can signal a reload
 _RELOAD_REQUESTED = False
@@ -256,7 +256,7 @@ class MLStrategy(BaseStrategy):
             # row whose target we are predicting), and all feature shifts are k>=1.
             # Trimming df5 before calling build_live_features shifts every index by one,
             # making safe(s,1) return N-2 instead of N-1 — a systematic one-candle lag
-            # that corrupts all 37 features and inverts the model's predictions.
+            # that corrupts all 42 features and inverts the model's predictions.
             #
             # 15m/1h/CVD are also NOT trimmed: build_live_features selects the most
             # recent candle with timestamp <= ts_n1 (the N-1 5m bar's timestamp) via

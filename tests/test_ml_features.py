@@ -19,7 +19,7 @@ def make_ohlcv(n=100, seed=42):
 
 
 def test_feature_count():
-    assert len(FEATURE_COLS) == 37
+    assert len(FEATURE_COLS) == 42
 
 
 def test_feature_order():
