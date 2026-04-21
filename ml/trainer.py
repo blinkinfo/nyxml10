@@ -91,8 +91,7 @@ def _build_trade_report_rows(
         p_down = float(1.0 - p_up)
         actual_up = int(actual_up)
         actual_down = 1 - actual_up
-        actual_up_label = "UP" if actual_up == 1 else "DOWN"
-        actual_down_label = "UP" if actual_down == 1 else "DOWN"
+        actual_result_label = "UP" if actual_up == 1 else "DOWN"
 
         if p_up >= up_threshold:
             rows.append({
@@ -105,7 +104,7 @@ def _build_trade_report_rows(
                 "signal": "UP",
                 "probability": p_up,
                 "threshold": float(up_threshold),
-                "actual_result": actual_up_label,
+                "actual_result": actual_result_label,
                 "is_win": bool(actual_up == 1),
                 "p_up": p_up,
                 "p_down": p_down,
@@ -122,7 +121,7 @@ def _build_trade_report_rows(
                 "signal": "DOWN",
                 "probability": p_down,
                 "threshold": float(down_threshold),
-                "actual_result": actual_down_label,
+                "actual_result": actual_result_label,
                 "is_win": bool(actual_down == 1),
                 "p_up": p_up,
                 "p_down": p_down,
