@@ -1214,6 +1214,7 @@ async def _retrain_background(application, chat_id) -> None:
     """Background retraining: fetch data, build features, train, save to DB, report."""
     import asyncio as _asyncio
     import html as _html
+    from pathlib import Path
     from ml import data_fetcher, features as feat_eng, trainer, model_store
 
     async def notify(text: str, reply_markup=None) -> None:
@@ -1226,6 +1227,21 @@ async def _retrain_background(application, chat_id) -> None:
             )
         except Exception as e:
             log.warning("_retrain_background: failed to send notification: %s", e)
+
+    async def notify_document(path: str, caption: str) -> bool:
+        try:
+            with open(path, "rb") as fh:
+                await application.bot.send_document(
+                    chat_id=int(chat_id),
+                    document=fh,
+                    filename=Path(path).name,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            return True
+        except Exception:
+            log.exception("_retrain_background: failed to send retrain report document")
+            return False
 
     try:
         loop = _asyncio.get_event_loop()
@@ -1257,6 +1273,10 @@ async def _retrain_background(application, chat_id) -> None:
         down_enabled   = result.get("down_enabled", False)
         down_val_wr    = result.get("down_val_wr", 0.0)
         down_test_wr   = result.get("down_test_metrics", {}).get("wr", 0.0)
+        report_info = result.get("report_info") or {}
+        report_error = result.get("report_error")
+        report_path = report_info.get("path")
+        report_sent = False
 
         # Persist up/down thresholds to DB
         try:
@@ -1283,9 +1303,20 @@ async def _retrain_background(application, chat_id) -> None:
                 down_enabled, down_val_wr, down_test_wr, down_threshold,
             )
             main_msg, risk_msg = format_retrain_blocked(meta, threshold)
+            if report_path and not report_error:
+                main_msg += "\n\n<b>Detailed Excel trade report:</b> attached below if delivery succeeds."
+            elif report_error:
+                main_msg += "\n\n<i>Detailed Excel trade report could not be generated. Retraining still completed normally.</i>"
             await notify(main_msg, reply_markup=retrain_blocked_keyboard())
             if risk_msg:
                 await notify(risk_msg)
+            if report_path and not report_error:
+                report_sent = await notify_document(
+                    report_path,
+                    "Detailed val/test trade ledger and hourly UTC stats from the completed retrain.",
+                )
+                if not report_sent:
+                    await notify("<i>Retrain finished, but the Excel report could not be sent to Telegram.</i>")
         else:
             log.info(
                 "Retrain complete. val_wr=%.4f test_wr=%.4f | "
@@ -1295,9 +1326,20 @@ async def _retrain_background(application, chat_id) -> None:
                 down_enabled, down_val_wr, down_test_wr, down_threshold,
             )
             main_msg, risk_msg = format_retrain_complete(meta, threshold)
+            if report_path and not report_error:
+                main_msg += "\n\n<b>Detailed Excel trade report:</b> attached below if delivery succeeds."
+            elif report_error:
+                main_msg += "\n\n<i>Detailed Excel trade report could not be generated. Retraining still completed normally.</i>"
             await notify(main_msg)
             if risk_msg:
                 await notify(risk_msg)
+            if report_path and not report_error:
+                report_sent = await notify_document(
+                    report_path,
+                    "Detailed val/test trade ledger and hourly UTC stats from the completed retrain.",
+                )
+                if not report_sent:
+                    await notify("<i>Retrain finished, but the Excel report could not be sent to Telegram.</i>")
             # Auto-promote: UP passed the gate — promote candidate to current now.
             try:
                 from ml import model_store as _ms

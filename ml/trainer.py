@@ -7,7 +7,8 @@ Threshold sweep ONLY on validation set, never on test set.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -18,6 +19,15 @@ from ml import model_store
 from ml.evaluator import compute_risk_metrics
 from ml.features import FEATURE_COLS
 from config import ML_PAYOUT_RATIO
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+except Exception:  # pragma: no cover - import failure handled at runtime
+    Workbook = None
+    Alignment = Font = PatternFill = None
+    get_column_letter = None
 
 # ---------------------------------------------------------------------------
 # Deployment gate — Blueprint Rule 10
@@ -53,6 +63,227 @@ LGBM_PARAMS = {
 
 NUM_BOOST_ROUND = 2000        # increased from 1000 — gives early stopping more room to find optimum
 EARLY_STOPPING_ROUNDS = 100   # increased from 50 — more patient stopping, avoids premature cutoff
+
+
+
+def _coerce_utc_timestamp(value: object) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _build_trade_report_rows(
+    dataset: str,
+    timestamps: pd.Series,
+    probs: np.ndarray,
+    y_true: np.ndarray,
+    up_threshold: float,
+    down_threshold: float,
+) -> list[dict]:
+    rows: list[dict] = []
+    for raw_ts, p_up, actual_up in zip(timestamps.tolist(), probs.tolist(), y_true.tolist()):
+        feature_ts = _coerce_utc_timestamp(raw_ts)
+        trade_start = feature_ts + timedelta(minutes=5)
+        trade_end = feature_ts + timedelta(minutes=10)
+        trade_slot_label = f"{trade_start.strftime('%H:%M')}-{trade_end.strftime('%H:%M')}"
+        p_up = float(p_up)
+        p_down = float(1.0 - p_up)
+        actual_up = int(actual_up)
+        actual_down = 1 - actual_up
+        actual_up_label = "UP" if actual_up == 1 else "DOWN"
+        actual_down_label = "UP" if actual_down == 1 else "DOWN"
+
+        if p_up >= up_threshold:
+            rows.append({
+                "dataset": dataset,
+                "side": "UP",
+                "feature_timestamp_utc": feature_ts.tz_localize(None).to_pydatetime(),
+                "trade_start_utc": trade_start.tz_localize(None).to_pydatetime(),
+                "trade_end_utc": trade_end.tz_localize(None).to_pydatetime(),
+                "trade_slot_utc_label": trade_slot_label,
+                "signal": "UP",
+                "probability": p_up,
+                "threshold": float(up_threshold),
+                "actual_result": actual_up_label,
+                "is_win": bool(actual_up == 1),
+                "p_up": p_up,
+                "p_down": p_down,
+            })
+
+        if p_down >= down_threshold:
+            rows.append({
+                "dataset": dataset,
+                "side": "DOWN",
+                "feature_timestamp_utc": feature_ts.tz_localize(None).to_pydatetime(),
+                "trade_start_utc": trade_start.tz_localize(None).to_pydatetime(),
+                "trade_end_utc": trade_end.tz_localize(None).to_pydatetime(),
+                "trade_slot_utc_label": trade_slot_label,
+                "signal": "DOWN",
+                "probability": p_down,
+                "threshold": float(down_threshold),
+                "actual_result": actual_down_label,
+                "is_win": bool(actual_down == 1),
+                "p_up": p_up,
+                "p_down": p_down,
+            })
+
+    rows.sort(key=lambda row: (row["feature_timestamp_utc"], row["side"]))
+    return rows
+
+
+def _build_hourly_trade_stats(trade_rows: list[dict]) -> list[dict]:
+    stats_rows: list[dict] = []
+    df = pd.DataFrame(trade_rows)
+    datasets = sorted(df["dataset"].dropna().unique().tolist()) if not df.empty else ["val", "test"]
+
+    for dataset in datasets:
+        if df.empty:
+            dataset_df = df
+        else:
+            dataset_df = df[df["dataset"] == dataset].copy()
+
+        if not dataset_df.empty:
+            dataset_df["utc_hour"] = pd.to_datetime(dataset_df["trade_start_utc"], utc=True).dt.hour
+            grouped = dataset_df.groupby("utc_hour", dropna=False)
+            hourly_map = {
+                int(hour): {
+                    "total_trades": int(len(group)),
+                    "up_trades": int((group["side"] == "UP").sum()),
+                    "down_trades": int((group["side"] == "DOWN").sum()),
+                    "wins": int(group["is_win"].sum()),
+                    "losses": int((~group["is_win"].astype(bool)).sum()),
+                }
+                for hour, group in grouped
+            }
+        else:
+            hourly_map = {}
+
+        for hour in range(24):
+            bucket = hourly_map.get(hour, {
+                "total_trades": 0,
+                "up_trades": 0,
+                "down_trades": 0,
+                "wins": 0,
+                "losses": 0,
+            })
+            total_trades = bucket["total_trades"]
+            wr_pct = (bucket["wins"] / total_trades) if total_trades else 0.0
+            stats_rows.append({
+                "dataset": dataset,
+                "utc_hour": hour,
+                "total_trades": total_trades,
+                "up_trades": bucket["up_trades"],
+                "down_trades": bucket["down_trades"],
+                "wins": bucket["wins"],
+                "losses": bucket["losses"],
+                "wr_pct": wr_pct,
+            })
+
+    return stats_rows
+
+
+def _apply_excel_formatting(workbook: Workbook) -> None:
+    if Workbook is None:
+        return
+
+    header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    header_alignment = Alignment(horizontal="center", vertical="center")
+
+    datetime_formats = {"feature_timestamp_utc", "trade_start_utc", "trade_end_utc"}
+    percent_formats = {"probability", "threshold", "p_up", "p_down", "wr_pct"}
+
+    for ws in workbook.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = True
+        ws.row_dimensions[1].height = 22
+
+        headers = [cell.value for cell in ws[1]]
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+
+        for col_idx, header in enumerate(headers, start=1):
+            letter = get_column_letter(col_idx)
+            max_len = len(str(header or ""))
+            for cell in ws[letter]:
+                if cell.row == 1:
+                    continue
+                if header in datetime_formats and cell.value:
+                    cell.number_format = "yyyy-mm-dd hh:mm:ss"
+                elif header in percent_formats and cell.value is not None:
+                    cell.number_format = "0.00%"
+                elif header in {"is_win", "utc_hour", "total_trades", "up_trades", "down_trades", "wins", "losses"}:
+                    cell.number_format = "0"
+                text_value = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(text_value))
+            ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 28)
+
+
+def generate_trade_report(
+    *,
+    timestamps_val: pd.Series,
+    timestamps_test: pd.Series,
+    val_probs: np.ndarray,
+    test_probs: np.ndarray,
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    up_threshold: float,
+    down_threshold: float,
+    slot: str,
+    output_dir: str | Path | None = None,
+) -> dict:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is unavailable")
+
+    out_dir = Path(output_dir or (Path("models") / "reports"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    trade_rows = []
+    trade_rows.extend(_build_trade_report_rows("val", timestamps_val, val_probs, y_val, up_threshold, down_threshold))
+    trade_rows.extend(_build_trade_report_rows("test", timestamps_test, test_probs, y_test, up_threshold, down_threshold))
+    hourly_rows = _build_hourly_trade_stats(trade_rows)
+
+    trade_columns = [
+        "dataset", "side", "feature_timestamp_utc", "trade_start_utc", "trade_end_utc",
+        "trade_slot_utc_label", "signal", "probability", "threshold", "actual_result",
+        "is_win", "p_up", "p_down",
+    ]
+    hourly_columns = [
+        "dataset", "utc_hour", "total_trades", "up_trades", "down_trades", "wins", "losses", "wr_pct",
+    ]
+
+    trade_df = pd.DataFrame(trade_rows, columns=trade_columns)
+    hourly_df = pd.DataFrame(hourly_rows, columns=hourly_columns)
+
+    workbook = Workbook()
+    ws_trades = workbook.active
+    ws_trades.title = "trade_ledger"
+    ws_trades.append(trade_columns)
+    for row in trade_df.itertuples(index=False, name=None):
+        ws_trades.append(list(row))
+
+    ws_hourly = workbook.create_sheet(title="hourly_utc_stats")
+    ws_hourly.append(hourly_columns)
+    for row in hourly_df.itertuples(index=False, name=None):
+        ws_hourly.append(list(row))
+
+    _apply_excel_formatting(workbook)
+
+    timestamp_now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    report_path = out_dir / f"retrain_trade_report_{slot}_{timestamp_now}.xlsx"
+    workbook.save(report_path)
+
+    return {
+        "path": str(report_path),
+        "trade_rows": int(len(trade_df)),
+        "hourly_rows": int(len(hourly_df)),
+        "datasets": sorted(trade_df["dataset"].unique().tolist()) if not trade_df.empty else ["val", "test"],
+    }
+
 
 # ---------------------------------------------------------------------------
 # Walk-forward validation constants
@@ -571,6 +802,9 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     X_train, y_train = X[:val_start], y[:val_start]
     X_val, y_val = X[val_start:split_boundary], y[val_start:split_boundary]
     X_test, y_test = X[split_boundary:], y[split_boundary:]
+    ts_all = df_features["timestamp"] if "timestamp" in df_features.columns else pd.Series(df_features.index, index=df_features.index)
+    ts_val = ts_all.iloc[val_start:split_boundary].reset_index(drop=True)
+    ts_test = ts_all.iloc[split_boundary:].reset_index(drop=True)
 
     log.info("train: X_train=%s X_val=%s X_test=%s", X_train.shape, X_val.shape, X_test.shape)
 
@@ -746,6 +980,24 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
             _wf_worst_dd_dollar = round(_test_risk["max_dd_dollar"] * _inv, 4)
             _wf_worst_dd_pct    = round(_test_risk["max_dd_pct"]    * _inv, 4)
 
+    report_info = None
+    report_error = None
+    try:
+        report_info = generate_trade_report(
+            timestamps_val=ts_val,
+            timestamps_test=ts_test,
+            val_probs=val_probs,
+            test_probs=test_probs,
+            y_val=y_val,
+            y_test=y_test,
+            up_threshold=best_threshold,
+            down_threshold=down_threshold,
+            slot=slot,
+        )
+    except Exception as report_exc:
+        report_error = str(report_exc)
+        log.exception("train: failed to generate Excel trade report (non-fatal)")
+
     metadata = {
         "train_date": datetime.utcnow().isoformat(),
         # Data window used for training
@@ -802,6 +1054,10 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "blocked": blocked,
         # Training feature distribution stats for drift monitoring (check_feature_drift)
         "training_feature_stats": _training_feature_stats,
+        "report_path": report_info["path"] if report_info else None,
+        "report_trade_rows": report_info["trade_rows"] if report_info else 0,
+        "report_hourly_rows": report_info["hourly_rows"] if report_info else 0,
+        "report_error": report_error,
     }
     model_store.save_model(model, slot, metadata)
 
@@ -819,6 +1075,8 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "best_iteration": model.best_iteration,
         "blocked": blocked,
         "wf_results": wf_results,
+        "report_info": report_info,
+        "report_error": report_error,
         "warning_reason": (
             f"Test WR {test_metrics['wr']*100:.2f}% is below the 59% deployment gate "
             f"(Blueprint Rule 10). Candidate saved but NOT auto-promoted."
