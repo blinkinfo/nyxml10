@@ -932,6 +932,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         demo_trade = await queries.is_demo_trade_enabled()
         trade_amount = await queries.get_trade_amount()
         invert_trades = await queries.is_invert_trades_enabled()
+        ml_volatility_gate_enabled = await queries.get_ml_volatility_gate_enabled()
         kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, amount, trade_mode, trade_pct, invert_trades, ml_volatility_gate_enabled)
         mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${trade_amount:.2f}"
         await update.message.reply_text(
