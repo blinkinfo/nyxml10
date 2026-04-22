@@ -246,12 +246,16 @@ class MLStrategy(BaseStrategy):
         try:
             # Fetch live data in parallel using executor (blocking ccxt calls)
             loop = asyncio.get_running_loop()
-            df5, df15, df1h, funding_rate, cvd_live = await asyncio.gather(
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60)),
+            df5 = await loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400))
+            df5_anchor_ts = None
+            if df5 is not None and not df5.empty and "timestamp" in df5.columns:
+                df5_anchor_ts = pd.to_datetime(df5["timestamp"], utc=True)
+
+            df15, df1h, funding_rate, cvd_live = await asyncio.gather(
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100, anchor_timestamps=df5_anchor_ts)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60, anchor_timestamps=df5_anchor_ts)),
                 loop.run_in_executor(None, data_fetcher.fetch_live_funding),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_gate_cvd(400)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_gate_cvd(400, anchor_timestamps=df5_anchor_ts)),
             )
 
             # --- Data quality snapshot (before dropping the forming candle) ---
@@ -302,6 +306,43 @@ class MLStrategy(BaseStrategy):
                 except Exception as _e:
                     log.debug("inference_logger: candle_n1 extraction failed: %s", _e)
 
+            # Rebuild the funding settlement history against the current 5m frame
+            # before feature construction. This prevents process-local cache drift
+            # from changing funding_zscore across long uptimes, restarts, or
+            # settlement-boundary timing differences.
+            funding_feature_records = self._funding_records
+            try:
+                funding_frame_end = pd.Timestamp(df5["timestamp"].max())
+                if funding_frame_end.tzinfo is None:
+                    funding_frame_end = funding_frame_end.tz_localize("UTC")
+                else:
+                    funding_frame_end = funding_frame_end.tz_convert("UTC")
+                canonical_funding_hist = data_fetcher.fetch_live_funding_history(
+                    n_periods=24,
+                    end_ts=funding_frame_end,
+                )
+                if canonical_funding_hist is not None and not canonical_funding_hist.empty:
+                    refreshed_records: deque = deque(maxlen=24)
+                    for row in canonical_funding_hist.itertuples(index=False):
+                        ts = pd.Timestamp(row.timestamp)
+                        if ts.tzinfo is None:
+                            ts = ts.tz_localize("UTC")
+                        else:
+                            ts = ts.tz_convert("UTC")
+                        rate = float(row.funding_rate)
+                        refreshed_records.append({"timestamp": ts, "funding_rate": rate})
+                    funding_feature_records = refreshed_records
+                    self._funding_records = deque(refreshed_records, maxlen=24)
+                    self._funding_buffer = deque((float(item["funding_rate"]) for item in refreshed_records), maxlen=24)
+                    self._last_funding_settlement = pd.Timestamp(refreshed_records[-1]["timestamp"]).to_pydatetime()
+                    if funding_rate is None:
+                        funding_rate = float(refreshed_records[-1]["funding_rate"])
+            except Exception as funding_refresh_exc:
+                log.warning(
+                    "MLStrategy: canonical funding history refresh failed; using cached records: %s",
+                    funding_refresh_exc,
+                )
+
             # Update funding rolling buffer — only append when a new 8h settlement
             # has occurred, matching training data semantics (one entry per settlement
             # period, not one entry per 5m check_signal call).
@@ -310,17 +351,18 @@ class MLStrategy(BaseStrategy):
                 if self._last_funding_settlement != current_settlement:
                     self._funding_buffer.append(funding_rate)
                     self._funding_records.append({"timestamp": pd.Timestamp(current_settlement), "funding_rate": float(funding_rate)})
+                    funding_feature_records = self._funding_records
                     self._last_funding_settlement = current_settlement
                     log.debug(
                         "MLStrategy: funding_buffer updated for settlement=%s rate=%.6f buffer_len=%d",
                         current_settlement.isoformat(), funding_rate, len(self._funding_buffer),
                     )
 
-            funding_buf_len = len(self._funding_buffer)
+            funding_buf_len = len(funding_feature_records)
 
             # Build feature row — returns (row, nan_features) 2-tuple
             feature_row, nan_features = feat_eng.build_live_features(
-                df5, df15, df1h, funding_rate, self._funding_records, cvd_live
+                df5, df15, df1h, funding_rate, funding_feature_records, cvd_live
             )
             if feature_row is None:
                 log.warning("MLStrategy: insufficient data for features, skipping")

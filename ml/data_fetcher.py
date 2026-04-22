@@ -736,20 +736,80 @@ def fetch_live_5m(limit: int = 400) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_live_15m(limit: int = 100) -> pd.DataFrame:
-    """Fetch last `limit` 15m candles from MEXC futures."""
-    exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
-    ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="15m", limit=limit)
-    df = _ohlcv_to_df(ohlcv)
-    return df.sort_values("timestamp").reset_index(drop=True)
+def fetch_live_15m(
+    limit: int = 100,
+    *,
+    end_ms: int | None = None,
+    anchor_timestamps: pd.Series | pd.Index | list | None = None,
+) -> pd.DataFrame:
+    """Fetch the most recent `limit` 15m candles from MEXC futures.
+
+    When anchor_timestamps is provided, the returned window is explicitly
+    anchored to the current live 5m frame rather than to exchange wall-clock
+    timing. This keeps higher-timeframe context selection aligned with the
+    canonical df5 ts_n1 merge semantics used by build_features().
+    """
+    effective_limit = max(1, int(limit))
+    buffer_candles = min(max(12, effective_limit // 4), 48)
+    window_candles = effective_limit + buffer_candles
+
+    anchor_end_ms = None
+    if anchor_timestamps is not None:
+        anchor_index = pd.to_datetime(pd.Index(anchor_timestamps), utc=True)
+        anchor_index = anchor_index[anchor_index.notna()]
+        if len(anchor_index) > 0:
+            anchor_end_ms = int(anchor_index.max().timestamp() * 1000) + (5 * 60 * 1000)
+
+    resolved_end_ms = int(end_ms) if end_ms is not None else anchor_end_ms
+    if resolved_end_ms is None:
+        exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
+        ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="15m", limit=effective_limit)
+        df = _ohlcv_to_df(ohlcv)
+        return df.sort_values("timestamp").reset_index(drop=True)
+
+    start_ms = resolved_end_ms - (window_candles * 15 * 60 * 1000)
+    df = fetch_15m(start_ms, resolved_end_ms)
+    if df.empty:
+        return df
+    return df.tail(effective_limit).sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_live_1h(limit: int = 60) -> pd.DataFrame:
-    """Fetch last `limit` 1h candles from MEXC futures."""
-    exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
-    ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=limit)
-    df = _ohlcv_to_df(ohlcv)
-    return df.sort_values("timestamp").reset_index(drop=True)
+def fetch_live_1h(
+    limit: int = 60,
+    *,
+    end_ms: int | None = None,
+    anchor_timestamps: pd.Series | pd.Index | list | None = None,
+) -> pd.DataFrame:
+    """Fetch the most recent `limit` 1h candles from MEXC futures.
+
+    When anchor_timestamps is provided, the returned window is explicitly
+    anchored to the current live 5m frame rather than to exchange wall-clock
+    timing. This keeps higher-timeframe context selection aligned with the
+    canonical df5 ts_n1 merge semantics used by build_features().
+    """
+    effective_limit = max(1, int(limit))
+    buffer_candles = min(max(8, effective_limit // 4), 24)
+    window_candles = effective_limit + buffer_candles
+
+    anchor_end_ms = None
+    if anchor_timestamps is not None:
+        anchor_index = pd.to_datetime(pd.Index(anchor_timestamps), utc=True)
+        anchor_index = anchor_index[anchor_index.notna()]
+        if len(anchor_index) > 0:
+            anchor_end_ms = int(anchor_index.max().timestamp() * 1000) + (5 * 60 * 1000)
+
+    resolved_end_ms = int(end_ms) if end_ms is not None else anchor_end_ms
+    if resolved_end_ms is None:
+        exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
+        ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=effective_limit)
+        df = _ohlcv_to_df(ohlcv)
+        return df.sort_values("timestamp").reset_index(drop=True)
+
+    start_ms = resolved_end_ms - (window_candles * 60 * 60 * 1000)
+    df = fetch_1h(start_ms, resolved_end_ms)
+    if df.empty:
+        return df
+    return df.tail(effective_limit).sort_values("timestamp").reset_index(drop=True)
 
 
 def fetch_live_funding() -> float | None:
@@ -763,24 +823,45 @@ def fetch_live_funding() -> float | None:
         return None
 
 
-def fetch_live_funding_history(n_periods: int = 24) -> pd.DataFrame:
-    """Fetch the last `n_periods` historical funding records for live parity.
+def fetch_live_funding_history(
+    n_periods: int = 24,
+    *,
+    end_ts: datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Fetch the last `n_periods` timestamped funding settlements for live parity.
 
-    MEXC funding settles every 8 hours. Returning timestamped records instead of
-    bare floats lets the live path reuse the same real funding timestamps used in
-    training, avoiding synthetic reconstruction in the feature wrapper.
+    The returned frame is anchored to an explicit end timestamp when provided,
+    so callers can rebuild the exact canonical funding history implied by the
+    scored 5m frame instead of relying on process-local runtime cache state.
     """
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=(n_periods + 4) * 8)
+    end = pd.Timestamp(end_ts if end_ts is not None else datetime.now(timezone.utc))
+    if end.tzinfo is None:
+        end = end.tz_localize('UTC')
+    else:
+        end = end.tz_convert('UTC')
+
+    # Include generous lookback slack so fetch_funding can survive sparse pages,
+    # deduplicate, and still return the last n_periods settlements <= end.
+    start = end - timedelta(hours=(n_periods + 8) * 8)
     start_ms = int(start.timestamp() * 1000)
-    end_ms = int(now.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
 
     try:
         df = fetch_funding(start_ms, end_ms)
         if df.empty:
             return pd.DataFrame(columns=["timestamp", "funding_rate"])
-        records = df[["timestamp", "funding_rate"]].tail(n_periods).reset_index(drop=True)
-        log.info("fetch_live_funding_history: fetched %d records for buffer seed", len(records))
+        records = (
+            df[df['timestamp'] <= end][['timestamp', 'funding_rate']]
+            .drop_duplicates(subset=['timestamp'], keep='last')
+            .sort_values('timestamp')
+            .tail(n_periods)
+            .reset_index(drop=True)
+        )
+        log.info(
+            "fetch_live_funding_history: fetched %d records for end=%s",
+            len(records),
+            end.isoformat(),
+        )
         return records
     except Exception as e:
         log.warning("fetch_live_funding_history error: %s", e)
