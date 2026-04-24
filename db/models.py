@@ -18,7 +18,15 @@ CREATE TABLE IF NOT EXISTS signals (
     resolved_at TIMESTAMP,
     skipped INTEGER DEFAULT 0,
     filter_blocked INTEGER DEFAULT 0,
-    pattern TEXT
+    pattern TEXT,
+    ml_p_up REAL,
+    ml_p_down REAL,
+    ml_probability_bucket TEXT,
+    ml_probability_used REAL,
+    threshold_policy_real TEXT,
+    threshold_policy_demo TEXT,
+    model_side TEXT,
+    signal_slug TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -40,6 +48,13 @@ CREATE TABLE IF NOT EXISTS trades (
     retry_count INTEGER DEFAULT 0,
     last_retry_at TIMESTAMP,
     is_demo INTEGER DEFAULT 0,
+    routing_mode TEXT,
+    routing_policy TEXT,
+    original_side TEXT,
+    routed_side TEXT,
+    policy_bucket TEXT,
+    policy_probability REAL,
+    signal_outcome_recorded INTEGER DEFAULT 0,
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 );
 
@@ -70,6 +85,16 @@ CREATE TABLE IF NOT EXISTS ml_config (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS threshold_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    probability_bucket TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    policy TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(probability_bucket, mode)
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -90,6 +115,15 @@ CREATE TABLE IF NOT EXISTS model_blobs (
     metadata TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_threshold_policies_mode_bucket
+ON threshold_policies (mode, probability_bucket);
+
+CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades (signal_id);
+CREATE INDEX IF NOT EXISTS idx_trades_policy_mode_bucket
+ON trades (is_demo, policy_bucket);
+CREATE INDEX IF NOT EXISTS idx_trades_signal_outcome_recorded
+ON trades (signal_id, signal_outcome_recorded);
 """
 
 DEFAULT_SETTINGS = {
@@ -115,7 +149,6 @@ async def init_db(db_path: str | None = None) -> None:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (key, value),
             )
-        # Seed default ML thresholds (INSERT OR IGNORE — never overwrite live values)
         await db.execute(
             "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold', '0.53')"
         )
@@ -125,8 +158,6 @@ async def init_db(db_path: str | None = None) -> None:
         await db.commit()
 
 
-# The 4 condition IDs incorrectly redeemed from the wrong address (sig-type-2 bug).
-# Deleting these records lets the redeemer retry them on the next scan.
 _BAD_CONDITION_IDS = [
     "0x46b556649c109de10c5be1be2dbc4ee3155909fee0d99230e17dbd51020fcb35",
     "0x1b447392bdf148658a553757511a4a9320ec36486ac42727fbe7c93a192158ae",
@@ -136,15 +167,6 @@ _BAD_CONDITION_IDS = [
 
 
 async def cleanup_bad_redemptions(db_path: str | None = None) -> int:
-    """One-time startup cleanup: delete incorrectly recorded redemption rows.
-
-    These 4 conditions were broadcast from the wrong address (EOA instead of
-    the proxy wallet) due to the sig-type-2 bug.  Removing the 'success'
-    records allows the redeemer to retry them on the next scan.
-
-    Safe to run repeatedly -- if no rows match, rowcount is 0.
-    Returns total rows deleted.
-    """
     path = db_path or cfg.DB_PATH
     total = 0
     async with aiosqlite.connect(path) as db:
@@ -159,18 +181,12 @@ async def cleanup_bad_redemptions(db_path: str | None = None) -> int:
 
 
 async def migrate_db(db_path: str | None = None) -> None:
-    """Add new columns/tables if they don't exist (safe to run repeatedly).
-
-    Every DDL step is wrapped in its own try/except so a single failure
-    never aborts the rest of the migration.
-    """
+    """Add new columns/tables if they don't exist (safe to run repeatedly)."""
     import logging
     log = logging.getLogger(__name__)
     path = db_path or cfg.DB_PATH
 
     async with aiosqlite.connect(path) as db:
-
-        # --- trades columns ---
         try:
             cursor = await db.execute("PRAGMA table_info(trades)")
             columns = {row[1] for row in await cursor.fetchall()}
@@ -180,10 +196,23 @@ async def migrate_db(db_path: str | None = None) -> None:
                 await db.execute("ALTER TABLE trades ADD COLUMN last_retry_at TIMESTAMP")
             if "is_demo" not in columns:
                 await db.execute("ALTER TABLE trades ADD COLUMN is_demo INTEGER DEFAULT 0")
+            if "routing_mode" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN routing_mode TEXT")
+            if "routing_policy" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN routing_policy TEXT")
+            if "original_side" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN original_side TEXT")
+            if "routed_side" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN routed_side TEXT")
+            if "policy_bucket" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN policy_bucket TEXT")
+            if "policy_probability" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN policy_probability REAL")
+            if "signal_outcome_recorded" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN signal_outcome_recorded INTEGER DEFAULT 0")
         except Exception as e:
             log.warning("migrate_db: trades column migration failed: %s", e)
 
-        # --- signals columns ---
         try:
             cursor2 = await db.execute("PRAGMA table_info(signals)")
             sig_columns = {row[1] for row in await cursor2.fetchall()}
@@ -191,10 +220,25 @@ async def migrate_db(db_path: str | None = None) -> None:
                 await db.execute("ALTER TABLE signals ADD COLUMN filter_blocked INTEGER DEFAULT 0")
             if "pattern" not in sig_columns:
                 await db.execute("ALTER TABLE signals ADD COLUMN pattern TEXT")
+            if "ml_p_up" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN ml_p_up REAL")
+            if "ml_p_down" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN ml_p_down REAL")
+            if "ml_probability_bucket" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN ml_probability_bucket TEXT")
+            if "ml_probability_used" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN ml_probability_used REAL")
+            if "threshold_policy_real" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN threshold_policy_real TEXT")
+            if "threshold_policy_demo" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN threshold_policy_demo TEXT")
+            if "model_side" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN model_side TEXT")
+            if "signal_slug" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN signal_slug TEXT")
         except Exception as e:
             log.warning("migrate_db: signals column migration failed: %s", e)
 
-        # --- redemptions columns ---
         try:
             cursor3 = await db.execute("PRAGMA table_info(redemptions)")
             red_columns = {row[1] for row in await cursor3.fetchall()}
@@ -209,7 +253,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: redemptions column migration failed: %s", e)
 
-        # --- ml_config table ---
         try:
             await db.execute(
                 "CREATE TABLE IF NOT EXISTS ml_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -217,7 +260,40 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: ml_config table creation failed: %s", e)
 
-        # --- model_registry table ---
+        try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS threshold_policies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    probability_bucket TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    policy TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(probability_bucket, mode)
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_threshold_policies_mode_bucket "
+                "ON threshold_policies (mode, probability_bucket)"
+            )
+        except Exception as e:
+            log.warning("migrate_db: threshold_policies migration failed: %s", e)
+
+        try:
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades (signal_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_policy_mode_bucket ON trades (is_demo, policy_bucket)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_signal_outcome_recorded ON trades (signal_id, signal_outcome_recorded)"
+            )
+        except Exception as e:
+            log.warning("migrate_db: trades indexes migration failed: %s", e)
+
         try:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS model_registry (
@@ -237,7 +313,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: model_registry table creation failed: %s", e)
 
-        # --- model_blobs table (DB-persisted model storage) ---
         try:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS model_blobs (
@@ -250,7 +325,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: model_blobs table creation failed: %s", e)
 
-        # --- seed default ML threshold ---
         try:
             await db.execute(
                 "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold', '0.56')"
@@ -258,7 +332,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: ml_threshold seed failed: %s", e)
 
-        # --- seed default ML DOWN threshold (1 - up_threshold = 1 - 0.56 = 0.44) ---
         try:
             await db.execute(
                 "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_down_threshold', '0.44')"
@@ -266,7 +339,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: ml_down_threshold seed failed: %s", e)
 
-        # --- seed default blocked threshold ranges (config.BLOCKED_THRESHOLD_RANGES default) ---
         try:
             default_ranges = ",".join(
                 f"{lo:.2f}-{hi:.2f}" for lo, hi in getattr(cfg, "BLOCKED_THRESHOLD_RANGES", [(0.20, 0.22)])
@@ -278,7 +350,6 @@ async def migrate_db(db_path: str | None = None) -> None:
         except Exception as e:
             log.warning("migrate_db: blocked_threshold_ranges seed failed: %s", e)
 
-        # --- seed default settings ---
         for key, value in DEFAULT_SETTINGS.items():
             try:
                 await db.execute(

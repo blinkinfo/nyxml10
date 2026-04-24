@@ -39,6 +39,7 @@ def main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("\U0001f916 ML Model", callback_data="cmd_ml"),
+            InlineKeyboardButton("Thresholds", callback_data="cmd_thresholds"),
         ],
         [
             InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
@@ -96,11 +97,6 @@ def settings_keyboard(
         ],
         # Destructive action — full-width, alone
         [InlineKeyboardButton("\U0001f504 Reset Bankroll", callback_data="reset_demo_bankroll")],
-        # Invert Trades
-        [InlineKeyboardButton(
-            f"\U0001f504 Invert Trades: {'ON' if invert_trades_on else 'OFF'}",
-            callback_data="toggle_invert_trades",
-        )],
         # ML volatility gate
         [InlineKeyboardButton(
             f"\U0001f6e1 ML Volatility Gate: {'ON' if ml_volatility_gate_enabled else 'OFF'}",
@@ -284,4 +280,39 @@ def ml_volatility_gate_confirm_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Disable Gate", callback_data="confirm_disable_ml_volatility_gate")],
         [InlineKeyboardButton("Keep Gate Enabled", callback_data="cancel_disable_ml_volatility_gate")],
         [InlineKeyboardButton("Back to Settings", callback_data="cmd_settings")],
+    ])
+
+
+def threshold_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('Real Policies', callback_data='thresholds_real'),
+            InlineKeyboardButton('Demo Policies', callback_data='thresholds_demo'),
+        ],
+        [
+            InlineKeyboardButton('Real Analytics', callback_data='threshold_stats_real'),
+            InlineKeyboardButton('Demo Analytics', callback_data='threshold_stats_demo'),
+        ],
+        [InlineKeyboardButton('Back to Menu', callback_data='cmd_menu')],
+    ])
+
+
+def threshold_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('Set Bucket Policy', callback_data=f'threshold_set_{mode}'),
+            InlineKeyboardButton('Clear Bucket Policy', callback_data=f'threshold_clear_{mode}'),
+        ],
+        [InlineKeyboardButton('Back', callback_data='cmd_thresholds')],
+    ])
+
+
+def threshold_policy_choice_keyboard(mode: str, bucket: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('FOLLOW', callback_data=f'threshold_policy_{mode}_{bucket}_FOLLOW'),
+            InlineKeyboardButton('BLOCK', callback_data=f'threshold_policy_{mode}_{bucket}_BLOCK'),
+            InlineKeyboardButton('INVERT', callback_data=f'threshold_policy_{mode}_{bucket}_INVERT'),
+        ],
+        [InlineKeyboardButton('Back', callback_data=f'thresholds_{mode}')],
     ])

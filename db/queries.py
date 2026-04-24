@@ -3,14 +3,55 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any
 
 import aiosqlite
 import config as cfg
 
 
+VALID_THRESHOLD_POLICIES = {"FOLLOW", "BLOCK", "INVERT"}
+VALID_THRESHOLD_MODES = {"real", "demo"}
+
+
 def _db() -> str:
     return cfg.DB_PATH
+
+
+def normalize_threshold_policy(value: str | None) -> str:
+    normalized = (value or "FOLLOW").strip().upper()
+    if normalized not in VALID_THRESHOLD_POLICIES:
+        raise ValueError(f"invalid threshold policy: {value}")
+    return normalized
+
+
+def normalize_threshold_mode(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in VALID_THRESHOLD_MODES:
+        raise ValueError(f"invalid threshold mode: {value}")
+    return normalized
+
+
+def truncate_probability_bucket(probability: float | int | str | None) -> str | None:
+    if probability is None:
+        return None
+    try:
+        dec = Decimal(str(probability))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if dec < Decimal("0"):
+        dec = Decimal("0")
+    if dec > Decimal("1"):
+        dec = Decimal("1")
+    return format(dec.quantize(Decimal("0.00"), rounding=ROUND_DOWN), ".2f")
+
+
+def invert_side(side: str | None) -> str | None:
+    if side == "Up":
+        return "Down"
+    if side == "Down":
+        return "Up"
+    return side
 
 
 # ---------------------------------------------------------------------------
@@ -46,15 +87,13 @@ async def get_trade_amount() -> float:
 
 
 async def get_trade_mode() -> str:
-    """Return 'fixed' or 'pct'."""
     val = await get_setting("trade_mode")
     return val if val in ("fixed", "pct") else "fixed"
 
 
 async def get_trade_pct() -> float:
-    """Return the percentage value for pct mode (e.g. 5.0 for 5%)."""
-    val = await get_setting("trade_pct")
     try:
+        val = await get_setting("trade_pct")
         pct = float(val) if val else cfg.TRADE_PCT
         return pct if 0 < pct <= 100 else cfg.TRADE_PCT
     except (ValueError, TypeError):
@@ -62,10 +101,6 @@ async def get_trade_pct() -> float:
 
 
 async def get_ml_volatility_gate_enabled() -> bool:
-    """Return True when the ML volatility regime gate should remain active.
-
-    Missing, invalid, or failed reads default to enabled for safety.
-    """
     try:
         val = await get_setting("ml_volatility_gate_enabled")
     except Exception:
@@ -81,25 +116,10 @@ async def get_ml_volatility_gate_enabled() -> bool:
 
 
 async def set_ml_volatility_gate_enabled(enabled: bool) -> None:
-    """Persist the ML volatility regime gate toggle."""
     await set_setting("ml_volatility_gate_enabled", "1" if enabled else "0")
 
 
 async def resolve_trade_amount(poly_client=None, is_demo: bool = False) -> tuple[float, str]:
-    """Resolve the trade amount based on current trade_mode setting.
-
-    Returns (amount_usdc, display_label) where:
-    - amount_usdc: the resolved float amount to trade
-    - display_label: human-readable string for notifications/logs
-
-    In 'pct' mode:
-    - Fetches live balance (real or demo bankroll)
-    - Applies percentage, floors at $1.00 minimum
-    - Falls back to fixed amount if balance fetch fails
-
-    In 'fixed' mode (default):
-    - Returns get_trade_amount() unchanged (zero behavior change)
-    """
     import logging
     log = logging.getLogger(__name__)
 
@@ -109,7 +129,6 @@ async def resolve_trade_amount(poly_client=None, is_demo: bool = False) -> tuple
     if mode == "fixed":
         return fixed_amount, f"${fixed_amount:.2f} (fixed)"
 
-    # PCT mode
     pct = await get_trade_pct()
 
     try:
@@ -118,33 +137,28 @@ async def resolve_trade_amount(poly_client=None, is_demo: bool = False) -> tuple
         else:
             if poly_client is None:
                 log.warning(
-                    "resolve_trade_amount: pct mode but poly_client is None — "
-                    "falling back to fixed amount $%.2f", fixed_amount
+                    "resolve_trade_amount: pct mode but poly_client is None - falling back to fixed amount $%.2f",
+                    fixed_amount,
                 )
                 return fixed_amount, f"${fixed_amount:.2f} (fixed, fallback)"
 
             from polymarket import account as pm_account
             balance = await pm_account.get_balance(poly_client)
-
             if balance is None:
                 log.warning(
-                    "resolve_trade_amount: balance fetch returned None — "
-                    "falling back to fixed amount $%.2f", fixed_amount
+                    "resolve_trade_amount: balance fetch returned None - falling back to fixed amount $%.2f",
+                    fixed_amount,
                 )
                 return fixed_amount, f"${fixed_amount:.2f} (fixed, fallback)"
-
     except Exception as exc:
         log.warning(
-            "resolve_trade_amount: balance fetch failed (%s) — "
-            "falling back to fixed amount $%.2f", exc, fixed_amount
+            "resolve_trade_amount: balance fetch failed (%s) - falling back to fixed amount $%.2f",
+            exc,
+            fixed_amount,
         )
         return fixed_amount, f"${fixed_amount:.2f} (fixed, fallback)"
 
     if balance <= 0:
-        log.warning(
-            "resolve_trade_amount: balance is $%.2f (zero/negative) — "
-            "using $1.00 minimum floor", balance
-        )
         return 1.0, f"$1.00 ({pct:.1f}% of ${balance:.2f}, floor applied)"
 
     raw = balance * (pct / 100.0)
@@ -152,24 +166,135 @@ async def resolve_trade_amount(poly_client=None, is_demo: bool = False) -> tuple
     label = f"${amount:.2f} ({pct:.1f}% of ${balance:.2f})"
     if raw < 1.0:
         label += " [floor $1.00]"
-
-    log.info(
-        "resolve_trade_amount: pct mode — balance=$%.2f pct=%.1f%% raw=$%.2f final=$%.2f",
-        balance, pct, raw, amount,
-    )
     return amount, label
 
 
 async def is_auto_redeem_enabled() -> bool:
-    """Return True if auto-redeem is toggled on in settings."""
     val = await get_setting("auto_redeem_enabled")
     return val == "true"
 
 
 async def is_invert_trades_enabled() -> bool:
-    """Return True if invert-trades mode is toggled on in settings."""
     val = await get_setting("invert_trades_enabled")
     return val == "true"
+
+
+# ---------------------------------------------------------------------------
+# Threshold policy helpers
+# ---------------------------------------------------------------------------
+
+async def get_threshold_policy(bucket: str | None, mode: str) -> str:
+    normalized_mode = normalize_threshold_mode(mode)
+    normalized_bucket = truncate_probability_bucket(bucket)
+    if normalized_bucket is None:
+        return "FOLLOW"
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT policy FROM threshold_policies WHERE probability_bucket = ? AND mode = ?",
+            (normalized_bucket, normalized_mode),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return "FOLLOW"
+        try:
+            return normalize_threshold_policy(row["policy"])
+        except ValueError:
+            return "FOLLOW"
+
+
+async def set_threshold_policy(bucket: str | float, mode: str, policy: str) -> None:
+    normalized_mode = normalize_threshold_mode(mode)
+    normalized_policy = normalize_threshold_policy(policy)
+    normalized_bucket = truncate_probability_bucket(bucket)
+    if normalized_bucket is None:
+        raise ValueError("invalid probability bucket")
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "INSERT INTO threshold_policies (probability_bucket, mode, policy, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(probability_bucket, mode) DO UPDATE SET policy = excluded.policy, updated_at = CURRENT_TIMESTAMP",
+            (normalized_bucket, normalized_mode, normalized_policy),
+        )
+        await db.commit()
+
+
+async def clear_threshold_policy(bucket: str | float, mode: str) -> None:
+    normalized_mode = normalize_threshold_mode(mode)
+    normalized_bucket = truncate_probability_bucket(bucket)
+    if normalized_bucket is None:
+        raise ValueError("invalid probability bucket")
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "DELETE FROM threshold_policies WHERE probability_bucket = ? AND mode = ?",
+            (normalized_bucket, normalized_mode),
+        )
+        await db.commit()
+
+
+async def list_threshold_policies(mode: str | None = None) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        if mode:
+            normalized_mode = normalize_threshold_mode(mode)
+            cursor = await db.execute(
+                "SELECT probability_bucket, mode, policy, updated_at FROM threshold_policies WHERE mode = ? ORDER BY probability_bucket ASC",
+                (normalized_mode,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT probability_bucket, mode, policy, updated_at FROM threshold_policies ORDER BY mode ASC, probability_bucket ASC"
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_threshold_policy_matrix(mode: str | None = None) -> dict[str, dict[str, str]]:
+    rows = await list_threshold_policies(mode=mode)
+    matrix: dict[str, dict[str, str]] = {"real": {}, "demo": {}}
+    for row in rows:
+        matrix.setdefault(row["mode"], {})[row["probability_bucket"]] = row["policy"]
+    return matrix
+
+
+async def decide_threshold_route(
+    *,
+    original_side: str,
+    probability: float | None,
+    bucket: str | None,
+    mode: str,
+    legacy_invert_enabled: bool = False,
+    legacy_blocked_ranges: list[tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    normalized_mode = normalize_threshold_mode(mode)
+    normalized_bucket = truncate_probability_bucket(bucket or probability)
+    policy = await get_threshold_policy(normalized_bucket, normalized_mode)
+    reasons: list[str] = []
+
+    if policy == "FOLLOW":
+        if legacy_invert_enabled and normalized_mode == "real":
+            policy = "INVERT"
+            reasons.append("legacy global invert applied as fallback")
+        elif legacy_blocked_ranges and probability is not None:
+            for lo, hi in legacy_blocked_ranges:
+                if lo <= float(probability) <= hi:
+                    policy = "BLOCK"
+                    reasons.append(f"legacy blocked threshold range [{lo:.2f}, {hi:.2f}] applied as fallback")
+                    break
+
+    routed_side = None if policy == "BLOCK" else original_side
+    if policy == "INVERT":
+        routed_side = invert_side(original_side)
+
+    return {
+        "mode": normalized_mode,
+        "policy": policy,
+        "bucket": normalized_bucket,
+        "probability": probability,
+        "original_side": original_side,
+        "routed_side": routed_side,
+        "blocked": policy == "BLOCK",
+        "reason": "; ".join(reasons) if reasons else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +309,21 @@ async def insert_signal(
     entry_price: float | None,
     opposite_price: float | None,
     skipped: bool = False,
-    filter_blocked: bool = False,  # Kept for DB schema backward-compatibility.
-                                   # The pre-trade filter was removed; this
-                                   # column is always written as False (0) and
-                                   # is never set to True by any active code path.
+    filter_blocked: bool = False,
     pattern: str | None = None,
+    ml_p_up: float | None = None,
+    ml_p_down: float | None = None,
+    ml_probability_bucket: str | None = None,
+    ml_probability_used: float | None = None,
+    threshold_policy_real: str | None = None,
+    threshold_policy_demo: str | None = None,
+    model_side: str | None = None,
+    signal_slug: str | None = None,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, "
-            "entry_price, opposite_price, skipped, filter_blocked, pattern) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, entry_price, opposite_price, skipped, filter_blocked, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo, model_side, signal_slug) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 slot_start,
                 slot_end,
@@ -205,10 +334,18 @@ async def insert_signal(
                 1 if skipped else 0,
                 1 if filter_blocked else 0,
                 pattern,
+                ml_p_up,
+                ml_p_down,
+                ml_probability_bucket,
+                ml_probability_used,
+                normalize_threshold_policy(threshold_policy_real) if threshold_policy_real else None,
+                normalize_threshold_policy(threshold_policy_demo) if threshold_policy_demo else None,
+                model_side,
+                signal_slug,
             ),
         )
         await db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        return cursor.lastrowid
 
 
 async def resolve_signal(signal_id: int, outcome: str, is_win: bool) -> None:
@@ -221,12 +358,21 @@ async def resolve_signal(signal_id: int, outcome: str, is_win: bool) -> None:
         await db.commit()
 
 
+async def mark_signal_resolved_if_unset(signal_id: int, outcome: str, is_win: bool) -> bool:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            "UPDATE signals SET outcome = ?, is_win = ?, resolved_at = ? WHERE id = ? AND is_win IS NULL",
+            (outcome, 1 if is_win else 0, now, signal_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def get_recent_signals(n: int = 10) -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (n,)
-        )
+        cursor = await db.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (n,))
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
@@ -266,11 +412,17 @@ async def insert_trade(
     fill_price: float | None = None,
     status: str = "pending",
     is_demo: bool = False,
+    routing_mode: str | None = None,
+    routing_policy: str | None = None,
+    original_side: str | None = None,
+    routed_side: str | None = None,
+    policy_bucket: str | None = None,
+    policy_probability: float | None = None,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO trades (signal_id, slot_start, slot_end, side, entry_price, "
-            "amount_usdc, order_id, fill_price, status, is_demo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, is_demo, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal_id,
                 slot_start,
@@ -282,10 +434,16 @@ async def insert_trade(
                 fill_price,
                 status,
                 1 if is_demo else 0,
+                normalize_threshold_mode(routing_mode) if routing_mode else ("demo" if is_demo else "real"),
+                normalize_threshold_policy(routing_policy) if routing_policy else "FOLLOW",
+                original_side or side,
+                routed_side or side,
+                truncate_probability_bucket(policy_bucket),
+                policy_probability,
             ),
         )
         await db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        return cursor.lastrowid
 
 
 async def update_trade_status(trade_id: int, status: str, order_id: str | None = None) -> None:
@@ -296,10 +454,7 @@ async def update_trade_status(trade_id: int, status: str, order_id: str | None =
                 (status, order_id, trade_id),
             )
         else:
-            await db.execute(
-                "UPDATE trades SET status = ? WHERE id = ?",
-                (status, trade_id),
-            )
+            await db.execute("UPDATE trades SET status = ? WHERE id = ?", (status, trade_id))
         await db.commit()
 
 
@@ -309,34 +464,35 @@ async def update_trade_retry(
     retry_count: int,
     order_id: str | None = None,
 ) -> None:
-    """Update trade with retry information."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(_db()) as db:
         if order_id:
             await db.execute(
-                "UPDATE trades SET status = ?, retry_count = ?, last_retry_at = ?, order_id = ? "
-                "WHERE id = ?",
+                "UPDATE trades SET status = ?, retry_count = ?, last_retry_at = ?, order_id = ? WHERE id = ?",
                 (status, retry_count, now, order_id, trade_id),
             )
         else:
             await db.execute(
-                "UPDATE trades SET status = ?, retry_count = ?, last_retry_at = ? "
-                "WHERE id = ?",
+                "UPDATE trades SET status = ?, retry_count = ?, last_retry_at = ? WHERE id = ?",
                 (status, retry_count, now, trade_id),
             )
         await db.commit()
 
 
-async def get_active_trade_for_signal(signal_id: int) -> dict[str, Any] | None:
-    """Check if a filled trade already exists for this signal.
+async def mark_trade_signal_outcome_recorded(trade_id: int) -> None:
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "UPDATE trades SET signal_outcome_recorded = 1 WHERE id = ?",
+            (trade_id,),
+        )
+        await db.commit()
 
-    Used as a duplicate guard before retrying FOK orders — if a trade is
-    already 'filled' we must not place another order for the same signal.
-    """
+
+async def get_active_trade_for_signal(signal_id: int) -> dict[str, Any] | None:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM trades WHERE signal_id = ? AND status = 'filled' LIMIT 1",
+            "SELECT * FROM trades WHERE signal_id = ? AND status = 'filled' AND is_demo = 0 LIMIT 1",
             (signal_id,),
         )
         row = await cursor.fetchone()
@@ -356,9 +512,7 @@ async def resolve_trade(trade_id: int, outcome: str, is_win: bool, pnl: float) -
 async def get_recent_trades(n: int = 10) -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM trades WHERE is_demo = 0 ORDER BY id DESC LIMIT ?", (n,)
-        )
+        cursor = await db.execute("SELECT * FROM trades WHERE is_demo = 0 ORDER BY id DESC LIMIT ?", (n,))
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
@@ -374,13 +528,19 @@ async def get_unresolved_trades() -> list[dict[str, Any]]:
 
 
 async def get_trade_by_signal(signal_id: int) -> dict[str, Any] | None:
+    trades = await get_trades_by_signal(signal_id)
+    return trades[0] if trades else None
+
+
+async def get_trades_by_signal(signal_id: int) -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM trades WHERE signal_id = ? LIMIT 1", (signal_id,)
+            "SELECT * FROM trades WHERE signal_id = ? ORDER BY is_demo ASC, id ASC",
+            (signal_id,),
         )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -399,16 +559,12 @@ async def insert_redemption(
     dry_run: bool = False,
     verified: bool = False,
 ) -> int:
-    """Insert a redemption record. Returns the new row id."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     resolved_at = now if status in ("success", "failed", "verified") else None
     verified_at = now if verified else None
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO redemptions "
-            "(condition_id, outcome_index, size, title, tx_hash, status, "
-            " error, gas_used, dry_run, resolved_at, verified, verified_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO redemptions (condition_id, outcome_index, size, title, tx_hash, status, error, gas_used, dry_run, resolved_at, verified, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 condition_id,
                 outcome_index,
@@ -425,11 +581,10 @@ async def insert_redemption(
             ),
         )
         await db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        return cursor.lastrowid
 
 
 async def get_recent_redemptions(n: int = 20) -> list[dict[str, Any]]:
-    """Return the *n* most recent non-dry-run redemption records."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -441,17 +596,10 @@ async def get_recent_redemptions(n: int = 20) -> list[dict[str, Any]]:
 
 
 async def redemption_already_recorded(condition_id: str) -> bool:
-    """Return True if a verified (non-dry-run) redemption exists for *condition_id*.
-
-    Only suppresses retries for verified redemptions.
-    Old 'success' rows with verified=0 are from the buggy EOA path — retry them.
-    """
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id FROM redemptions "
-            "WHERE condition_id = ? AND dry_run = 0 "
-            "AND (status = 'verified' OR (status = 'success' AND verified = 1)) LIMIT 1",
+            "SELECT id FROM redemptions WHERE condition_id = ? AND dry_run = 0 AND (status = 'verified' OR (status = 'success' AND verified = 1)) LIMIT 1",
             (condition_id,),
         )
         row = await cursor.fetchone()
@@ -459,11 +607,6 @@ async def redemption_already_recorded(condition_id: str) -> bool:
 
 
 async def delete_redemptions_for_condition(condition_id: str) -> int:
-    """Delete ALL redemption records for *condition_id* (any status, non-dry-run).
-
-    Use this to clear incorrectly recorded 'success' entries so the scheduler
-    will retry redemption on the next scan.  Returns the number of rows deleted.
-    """
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             "DELETE FROM redemptions WHERE condition_id = ? AND dry_run = 0",
@@ -474,64 +617,37 @@ async def delete_redemptions_for_condition(condition_id: str) -> int:
 
 
 async def update_redemption_verified(redemption_id: int) -> None:
-    """Mark a redemption row as verified: set verified=1, verified_at=now, status='verified'."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(_db()) as db:
         await db.execute(
-            "UPDATE redemptions SET verified = 1, verified_at = ?, status = 'verified' "
-            "WHERE id = ?",
+            "UPDATE redemptions SET verified = 1, verified_at = ?, status = 'verified' WHERE id = ?",
             (now, redemption_id),
         )
         await db.commit()
 
 
 async def get_unverified_success_redemptions() -> list[dict[str, Any]]:
-    """Return all non-dry-run redemption rows where status='success' and verified=0.
-
-    These are candidates for re-verification or retry (e.g. rows recorded by
-    the buggy EOA path that succeeded on-chain but may not have actually redeemed).
-    """
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM redemptions "
-            "WHERE status = 'success' AND verified = 0 AND dry_run = 0 "
-            "ORDER BY id ASC"
+            "SELECT * FROM redemptions WHERE status = 'success' AND verified = 0 AND dry_run = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
 
 async def get_redemption_stats() -> dict[str, Any]:
-    """Aggregate stats for the /redemptions command dashboard."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-
-        total_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0"
-        )).fetchone()
-        total = total_row["cnt"] if total_row else 0
-
-        success_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'success'"
-        )).fetchone()
-        success = success_row["cnt"] if success_row else 0
-
-        failed_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'failed'"
-        )).fetchone()
-        failed = failed_row["cnt"] if failed_row else 0
-
-        size_row = await (await db.execute(
-            "SELECT SUM(size) as total_size FROM redemptions WHERE dry_run = 0 AND status = 'success'"
-        )).fetchone()
-        total_size = float(size_row["total_size"] or 0) if size_row else 0.0
-
+        total_row = await (await db.execute("SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0")).fetchone()
+        success_row = await (await db.execute("SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'success'" )).fetchone()
+        failed_row = await (await db.execute("SELECT COUNT(*) as cnt FROM redemptions WHERE dry_run = 0 AND status = 'failed'" )).fetchone()
+        size_row = await (await db.execute("SELECT SUM(size) as total_size FROM redemptions WHERE dry_run = 0 AND status = 'success'" )).fetchone()
     return {
-        "total":      total,
-        "success":    success,
-        "failed":     failed,
-        "total_size": round(total_size, 4),
+        "total": total_row["cnt"] if total_row else 0,
+        "success": success_row["cnt"] if success_row else 0,
+        "failed": failed_row["cnt"] if failed_row else 0,
+        "total_size": round(float(size_row["total_size"] or 0) if size_row else 0.0, 4),
     }
 
 
@@ -540,20 +656,17 @@ async def get_redemption_stats() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _compute_streaks(results: list[int]) -> dict[str, Any]:
-    """Given a list of 1/0 (win/loss) in chronological order, compute streaks."""
     if not results:
         return {
-            "current_streak":      0,
+            "current_streak": 0,
             "current_streak_type": None,
-            "best_win_streak":     0,
-            "worst_loss_streak":   0,
+            "best_win_streak": 0,
+            "worst_loss_streak": 0,
         }
-
     best_win = 0
     worst_loss = 0
     streak = 1
     prev = results[0]
-
     for i in range(len(results)):
         if i == 0:
             streak = 1
@@ -566,8 +679,6 @@ def _compute_streaks(results: list[int]) -> dict[str, Any]:
             best_win = max(best_win, streak)
         else:
             worst_loss = max(worst_loss, streak)
-
-    # Compute current streak from the end.
     current_type = results[-1]
     current = 0
     for v in reversed(results):
@@ -575,12 +686,11 @@ def _compute_streaks(results: list[int]) -> dict[str, Any]:
             current += 1
         else:
             break
-
     return {
-        "current_streak":      current,
+        "current_streak": current,
         "current_streak_type": "W" if current_type == 1 else "L",
-        "best_win_streak":     best_win,
-        "worst_loss_streak":   worst_loss,
+        "best_win_streak": best_win,
+        "worst_loss_streak": worst_loss,
     }
 
 
@@ -589,120 +699,80 @@ def _compute_streaks(results: list[int]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def get_signal_stats(limit: int | None = None) -> dict[str, Any]:
-    """Return aggregate signal statistics.
-
-    Note: filter_blocked_count is always 0 because the pre-trade filter was
-    removed.  The column is kept in the DB schema for backward compatibility
-    but no active code path sets it to 1.
-    """
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-
-        # Total active signals (non-skipped).
-        total_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM signals WHERE skipped = 0"
-        )).fetchone()
-        total = total_row["cnt"] if total_row else 0
-
-        # Skip count.
-        skip_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM signals WHERE skipped = 1"
-        )).fetchone()
-        skip_count = skip_row["cnt"] if skip_row else 0
-
-        # Resolved signals for win/loss stats (exclude skipped).
+        total_row = await (await db.execute("SELECT COUNT(*) as cnt FROM signals WHERE skipped = 0")).fetchone()
+        skip_row = await (await db.execute("SELECT COUNT(*) as cnt FROM signals WHERE skipped = 1")).fetchone()
         if limit:
-            inner = (
-                f"SELECT * FROM signals WHERE skipped = 0 AND is_win IS NOT NULL "
-                f"ORDER BY id DESC LIMIT {limit}"
-            )
+            inner = f"SELECT * FROM signals WHERE skipped = 0 AND is_win IS NOT NULL ORDER BY id DESC LIMIT {limit}"
             query = f"SELECT is_win FROM ({inner}) ORDER BY id ASC"
         else:
-            query = (
-                "SELECT is_win FROM signals "
-                "WHERE skipped = 0 AND is_win IS NOT NULL "
-                "ORDER BY id ASC"
-            )
-
+            query = "SELECT is_win FROM signals WHERE skipped = 0 AND is_win IS NOT NULL ORDER BY id ASC"
         cursor = await db.execute(query)
         rows = await cursor.fetchall()
         results = [r["is_win"] for r in rows]
-
     wins = sum(1 for r in results if r == 1)
     losses = sum(1 for r in results if r == 0)
     resolved = wins + losses
     win_pct = (wins / resolved * 100) if resolved else 0.0
     streaks = _compute_streaks(results)
-
     return {
-        "total_signals": total,
-        "skip_count":    skip_count,
-        "wins":          wins,
-        "losses":        losses,
-        "resolved":      resolved,
-        "win_pct":       round(win_pct, 1),
+        "total_signals": total_row["cnt"] if total_row else 0,
+        "skip_count": skip_row["cnt"] if skip_row else 0,
+        "wins": wins,
+        "losses": losses,
+        "resolved": resolved,
+        "win_pct": round(win_pct, 1),
         **streaks,
     }
 
 
-async def get_trade_stats(limit: int | None = None) -> dict[str, Any]:
+async def _get_trade_stats_by_demo_flag(is_demo: bool, limit: int | None = None) -> dict[str, Any]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-
+        flag = 1 if is_demo else 0
         if limit:
-            inner = (
-                f"SELECT * FROM trades WHERE is_win IS NOT NULL AND is_demo = 0 "
-                f"ORDER BY id DESC LIMIT {limit}"
-            )
+            inner = f"SELECT * FROM trades WHERE is_win IS NOT NULL AND is_demo = {flag} ORDER BY id DESC LIMIT {limit}"
             query = f"SELECT is_win, amount_usdc, pnl FROM ({inner}) ORDER BY id ASC"
         else:
-            query = (
-                "SELECT is_win, amount_usdc, pnl FROM trades "
-                "WHERE is_win IS NOT NULL AND is_demo = 0 ORDER BY id ASC"
-            )
-
+            query = f"SELECT is_win, amount_usdc, pnl FROM trades WHERE is_win IS NOT NULL AND is_demo = {flag} ORDER BY id ASC"
         cursor = await db.execute(query)
         rows = await cursor.fetchall()
-
-        total_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM trades WHERE is_demo = 0"
-        )).fetchone()
-        total_trades = total_row["cnt"] if total_row else 0
-
+        total_row = await (await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE is_demo = ?", (flag,))).fetchone()
     results = [r["is_win"] for r in rows]
     wins = sum(1 for r in results if r == 1)
     losses = sum(1 for r in results if r == 0)
     resolved = wins + losses
     win_pct = (wins / resolved * 100) if resolved else 0.0
-
     total_deployed = sum(r["amount_usdc"] for r in rows)
     total_pnl = sum(r["pnl"] for r in rows if r["pnl"] is not None)
     total_returned = total_deployed + total_pnl
     roi_pct = (total_pnl / total_deployed * 100) if total_deployed else 0.0
-
-    streaks = _compute_streaks(results)
-
-    return {
-        "total_trades":   total_trades,
-        "wins":           wins,
-        "losses":         losses,
-        "resolved":       resolved,
-        "win_pct":        round(win_pct, 1),
+    result = {
+        "total_trades": total_row["cnt"] if total_row else 0,
+        "wins": wins,
+        "losses": losses,
+        "resolved": resolved,
+        "win_pct": round(win_pct, 1),
         "total_deployed": round(total_deployed, 2),
         "total_returned": round(total_returned, 2),
-        "net_pnl":        round(total_pnl, 2),
-        "roi_pct":        round(roi_pct, 1),
-        **streaks,
+        "net_pnl": round(total_pnl, 2),
+        "roi_pct": round(roi_pct, 1),
     }
+    if not is_demo:
+        result.update(_compute_streaks(results))
+    return result
+
+
+async def get_trade_stats(limit: int | None = None) -> dict[str, Any]:
+    return await _get_trade_stats_by_demo_flag(False, limit=limit)
 
 
 async def get_all_signals_for_export() -> list[dict[str, Any]]:
-    """Return all non-skipped signals ordered by id for CSV/Excel export."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, slot_start, side, entry_price, is_win, pattern "
-            "FROM signals WHERE skipped = 0 ORDER BY id ASC"
+            "SELECT id, slot_start, side, model_side, entry_price, is_win, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo FROM signals WHERE skipped = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -713,27 +783,20 @@ async def get_all_signals_for_export() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 async def is_demo_trade_enabled() -> bool:
-    """Return True if demo trading mode is toggled on in settings."""
     val = await get_setting("demo_trade_enabled")
     return val == "true"
 
 
 async def get_demo_bankroll() -> float:
-    """Return the current demo bankroll balance in USDC."""
     val = await get_setting("demo_bankroll_usdc")
     return float(val) if val else 1000.00
 
 
 async def set_demo_bankroll(amount: float) -> None:
-    """Directly set the demo bankroll to a specific amount."""
     await set_setting("demo_bankroll_usdc", f"{amount:.2f}")
 
 
 async def adjust_demo_bankroll(delta: float) -> float:
-    """Add delta (positive or negative) to the demo bankroll.
-
-    Returns the new balance.  The bankroll is clamped to >= 0.
-    """
     current = await get_demo_bankroll()
     new_balance = max(0.0, round(current + delta, 2))
     await set_setting("demo_bankroll_usdc", f"{new_balance:.2f}")
@@ -741,7 +804,6 @@ async def adjust_demo_bankroll(delta: float) -> float:
 
 
 async def reset_demo_bankroll(starting_amount: float = 1000.00) -> None:
-    """Reset the demo bankroll to the given starting amount (default $1000)."""
     await set_setting("demo_bankroll_usdc", f"{starting_amount:.2f}")
 
 
@@ -750,74 +812,18 @@ async def reset_demo_bankroll(starting_amount: float = 1000.00) -> None:
 # ---------------------------------------------------------------------------
 
 async def get_demo_trade_stats(limit: int | None = None) -> dict[str, Any]:
-    """Return aggregate P&L stats for demo trades only."""
-    async with aiosqlite.connect(_db()) as db:
-        db.row_factory = aiosqlite.Row
-
-        if limit:
-            inner = (
-                f"SELECT * FROM trades WHERE is_demo = 1 AND is_win IS NOT NULL "
-                f"ORDER BY id DESC LIMIT {limit}"
-            )
-            query = f"SELECT is_win, amount_usdc, pnl FROM ({inner}) ORDER BY id ASC"
-        else:
-            query = (
-                "SELECT is_win, amount_usdc, pnl FROM trades "
-                "WHERE is_demo = 1 AND is_win IS NOT NULL ORDER BY id ASC"
-            )
-
-        cursor = await db.execute(query)
-        rows = await cursor.fetchall()
-
-        total_row = await (await db.execute(
-            "SELECT COUNT(*) as cnt FROM trades WHERE is_demo = 1"
-        )).fetchone()
-        total_trades = total_row["cnt"] if total_row else 0
-
-    results = [r["is_win"] for r in rows]
-    wins = sum(1 for r in results if r == 1)
-    losses = sum(1 for r in results if r == 0)
-    resolved = wins + losses
-    win_pct = (wins / resolved * 100) if resolved else 0.0
-
-    total_deployed = sum(r["amount_usdc"] for r in rows)
-    total_pnl = sum(r["pnl"] for r in rows if r["pnl"] is not None)
-    total_returned = total_deployed + total_pnl
-    roi_pct = (total_pnl / total_deployed * 100) if total_deployed else 0.0
-
-    return {
-        "total_trades":   total_trades,
-        "wins":           wins,
-        "losses":         losses,
-        "resolved":       resolved,
-        "win_pct":        round(win_pct, 1),
-        "total_deployed": round(total_deployed, 2),
-        "total_returned": round(total_returned, 2),
-        "net_pnl":        round(total_pnl, 2),
-        "roi_pct":        round(roi_pct, 1),
-    }
+    return await _get_trade_stats_by_demo_flag(True, limit=limit)
 
 
 async def get_recent_demo_trades(n: int = 10) -> list[dict[str, Any]]:
-    """Return the n most recent demo trades."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM trades WHERE is_demo = 1 ORDER BY id DESC LIMIT ?", (n,)
-        )
+        cursor = await db.execute("SELECT * FROM trades WHERE is_demo = 1 ORDER BY id DESC LIMIT ?", (n,))
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
 
 async def delete_failed_redemptions_by_condition(condition_id: str) -> int:
-    """Delete all non-dry-run redemption records for *condition_id* regardless of status.
-
-    Used to clear incorrectly recorded 'success' entries caused by the
-    sig-type-2 / wrong-from-address bug, so the redeemer will attempt them
-    again on the next scan.
-
-    Returns the number of rows deleted.
-    """
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             "DELETE FROM redemptions WHERE condition_id = ? AND dry_run = 0",
@@ -832,28 +838,18 @@ async def delete_failed_redemptions_by_condition(condition_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 async def get_pattern_stats() -> list[dict[str, Any]]:
-    """Return per-pattern performance stats across all resolved real trades.
-
-    Joins signals -> trades on signal_id, groups by pattern, and computes:
-      - total trades, wins, losses, win_pct, wl_ratio
-      - total_deployed (USDC), net_pnl, roi_pct
-      - last_seen (most recent slot_start for that pattern)
-
-    Only resolved real trades (is_demo=0, is_win IS NOT NULL) are counted.
-    Patterns are sorted by win_pct DESC, then total_trades DESC.
-    """
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
             SELECT
-                s.pattern                          AS pattern,
-                COUNT(t.id)                        AS total_trades,
+                s.pattern AS pattern,
+                COUNT(t.id) AS total_trades,
                 SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) AS wins,
                 SUM(CASE WHEN t.is_win = 0 THEN 1 ELSE 0 END) AS losses,
-                SUM(t.amount_usdc)                 AS total_deployed,
-                SUM(COALESCE(t.pnl, 0))            AS net_pnl,
-                MAX(s.slot_start)                  AS last_seen
+                SUM(t.amount_usdc) AS total_deployed,
+                SUM(COALESCE(t.pnl, 0)) AS net_pnl,
+                MAX(s.slot_start) AS last_seen
             FROM trades t
             JOIN signals s ON t.signal_id = s.id
             WHERE t.is_demo = 0
@@ -861,41 +857,108 @@ async def get_pattern_stats() -> list[dict[str, Any]]:
               AND s.pattern IS NOT NULL
               AND s.pattern != ''
             GROUP BY s.pattern
-            ORDER BY
-                (SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(t.id)) DESC,
-                COUNT(t.id) DESC
+            ORDER BY (SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(t.id)) DESC,
+                     COUNT(t.id) DESC
             """
         )
         rows = await cursor.fetchall()
-
     result = []
     for r in rows:
-        total   = r["total_trades"]
-        wins    = r["wins"]
-        losses  = r["losses"]
+        total = r["total_trades"]
+        wins = r["wins"]
+        losses = r["losses"]
         deployed = float(r["total_deployed"] or 0)
-        pnl     = float(r["net_pnl"] or 0)
-        win_pct = round(wins / total * 100, 1) if total else 0.0
-        wl_ratio = round(wins / losses, 2) if losses else float("inf")
-        roi_pct = round(pnl / deployed * 100, 1) if deployed else 0.0
+        pnl = float(r["net_pnl"] or 0)
         result.append({
-            "pattern":        r["pattern"],
-            "total_trades":   total,
-            "wins":           wins,
-            "losses":         losses,
-            "win_pct":        win_pct,
-            "wl_ratio":       wl_ratio,
+            "pattern": r["pattern"],
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "win_pct": round(wins / total * 100, 1) if total else 0.0,
+            "wl_ratio": round(wins / losses, 2) if losses else float("inf"),
             "total_deployed": round(deployed, 2),
-            "net_pnl":        round(pnl, 2),
-            "roi_pct":        roi_pct,
-            "last_seen":      r["last_seen"],
+            "net_pnl": round(pnl, 2),
+            "roi_pct": round(pnl / deployed * 100, 1) if deployed else 0.0,
+            "last_seen": r["last_seen"],
         })
     return result
 
 
 async def get_pattern_stats_for_export() -> list[dict[str, Any]]:
-    """Same as get_pattern_stats() but returns all fields needed for XLS export."""
     return await get_pattern_stats()
+
+
+# ---------------------------------------------------------------------------
+# Threshold analytics
+# ---------------------------------------------------------------------------
+
+async def get_threshold_stats(mode: str, limit: int | None = None) -> list[dict[str, Any]]:
+    normalized_mode = normalize_threshold_mode(mode)
+    policy_col = "threshold_policy_demo" if normalized_mode == "demo" else "threshold_policy_real"
+    query = f"""
+        SELECT
+            s.ml_probability_bucket AS bucket,
+            COALESCE(s.{policy_col}, 'FOLLOW') AS policy,
+            COUNT(*) AS total_signals,
+            SUM(CASE WHEN COALESCE(s.{policy_col}, 'FOLLOW') = 'BLOCK' THEN 1 ELSE 0 END) AS blocked_signals,
+            SUM(CASE WHEN COALESCE(s.{policy_col}, 'FOLLOW') != 'BLOCK' THEN 1 ELSE 0 END) AS executed_signals,
+            SUM(CASE WHEN t.is_win = 1 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN t.is_win = 0 THEN 1 ELSE 0 END) AS losses,
+            SUM(COALESCE(t.amount_usdc, 0)) AS total_deployed,
+            SUM(COALESCE(t.pnl, 0)) AS net_pnl,
+            MAX(s.slot_start) AS last_seen
+        FROM signals s
+        LEFT JOIN trades t
+          ON t.signal_id = s.id
+         AND t.routing_mode = ?
+         AND t.policy_bucket = s.ml_probability_bucket
+         AND t.routing_policy = COALESCE(s.{policy_col}, 'FOLLOW')
+        WHERE s.ml_probability_bucket IS NOT NULL
+        GROUP BY s.ml_probability_bucket, COALESCE(s.{policy_col}, 'FOLLOW')
+        ORDER BY s.ml_probability_bucket ASC, policy ASC
+    """
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(query, (normalized_mode,))
+        rows = await cursor.fetchall()
+    items = []
+    for row in rows:
+        executed = int(row["executed_signals"] or 0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        deployed = float(row["total_deployed"] or 0)
+        pnl = float(row["net_pnl"] or 0)
+        items.append({
+            "bucket": row["bucket"],
+            "policy": row["policy"] or "FOLLOW",
+            "total_signals": int(row["total_signals"] or 0),
+            "blocked_signals": int(row["blocked_signals"] or 0),
+            "executed_signals": executed,
+            "total_trades": executed,
+            "wins": wins,
+            "losses": losses,
+            "win_pct": round((wins / executed) * 100, 2) if executed else 0.0,
+            "total_deployed": round(deployed, 2),
+            "net_pnl": round(pnl, 2),
+            "roi_pct": round((pnl / deployed) * 100, 2) if deployed else 0.0,
+            "last_seen": row["last_seen"],
+        })
+    if limit is not None:
+        return items[:limit]
+    return items
+
+
+async def get_recent_threshold_routed_trades(mode: str, n: int = 10) -> list[dict[str, Any]]:
+    normalized_mode = normalize_threshold_mode(mode)
+    is_demo = 1 if normalized_mode == "demo" else 0
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE is_demo = ? ORDER BY id DESC LIMIT ?",
+            (is_demo, n),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -903,7 +966,6 @@ async def get_pattern_stats_for_export() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 async def get_ml_config(key: str) -> str | None:
-    """Read a value from ml_config table."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT value FROM ml_config WHERE key = ?", (key,))
@@ -912,18 +974,15 @@ async def get_ml_config(key: str) -> str | None:
 
 
 async def set_ml_config(key: str, value: str) -> None:
-    """Upsert a value in ml_config table."""
     async with aiosqlite.connect(_db()) as db:
         await db.execute(
-            "INSERT INTO ml_config (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO ml_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
         await db.commit()
 
 
 async def get_ml_threshold() -> float:
-    """Get current ML inference threshold from DB."""
     val = await get_ml_config("ml_threshold")
     if val is not None:
         try:
@@ -934,16 +993,10 @@ async def get_ml_threshold() -> float:
 
 
 async def set_ml_threshold(threshold: float) -> None:
-    """Persist ML inference threshold to DB."""
     await set_ml_config("ml_threshold", str(threshold))
 
 
 async def get_ml_down_threshold() -> float | None:
-    """Get current ML DOWN inference threshold from DB.
-
-    Returns None if not set — callers should derive it as 1 - up_threshold
-    when absent (backwards-compatible with pre-DOWN-support models).
-    """
     val = await get_ml_config("ml_down_threshold")
     if val is not None:
         try:
@@ -954,17 +1007,10 @@ async def get_ml_down_threshold() -> float | None:
 
 
 async def set_ml_down_threshold(threshold: float) -> None:
-    """Persist ML DOWN inference threshold to DB."""
     await set_ml_config("ml_down_threshold", str(threshold))
 
 
 def _parse_ranges_raw(raw: str | None) -> list[tuple[float, float]]:
-    """Parse '0.20-0.22,0.40-0.42' → [(0.20, 0.22), (0.40, 0.42)].
-
-    Mirrors config._parse_blocked_ranges but duplicated here so the DB
-    query module is self-contained and independent of internal config
-    function names.
-    """
     ranges: list[tuple[float, float]] = []
     if not raw or not raw.strip():
         return ranges
@@ -985,17 +1031,13 @@ def _parse_ranges_raw(raw: str | None) -> list[tuple[float, float]]:
 
 
 def _format_ranges(ranges: list[tuple[float, float]]) -> str:
-    """Format [(0.2, 0.22)] → '0.20-0.22'."""
     return ",".join(f"{lo:.2f}-{hi:.2f}" for lo, hi in ranges)
 
 
 async def get_blocked_threshold_ranges() -> list[tuple[float, float]]:
-    """Get blocked threshold ranges from DB, falling back to config default."""
     val = await get_ml_config("blocked_threshold_ranges")
-    # Row doesn't exist yet (first boot) — use config default
     if val is None:
         return cfg.BLOCKED_THRESHOLD_RANGES
-    # Sentinel: user explicitly cleared all ranges
     if val == "__NONE__":
         return []
     if not val.strip():
@@ -1005,11 +1047,6 @@ async def get_blocked_threshold_ranges() -> list[tuple[float, float]]:
 
 
 async def set_blocked_threshold_ranges(ranges: list[tuple[float, float]]) -> None:
-    """Persist blocked threshold ranges to DB.
-
-    If ranges is empty, sets a sentinel so the getter returns [] rather
-    than falling back to config default.
-    """
     formatted = "__NONE__" if not ranges else _format_ranges(ranges)
     await set_ml_config("blocked_threshold_ranges", formatted)
 
@@ -1029,22 +1066,19 @@ async def insert_model_registry(
     path: str,
     metadata_json: str,
 ) -> int:
-    """Insert a new model registry entry. Returns the new row id."""
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             """INSERT INTO model_registry
                (slot, train_date, wr, precision_score, trades_per_day, threshold,
                 sample_count, path, metadata)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (slot, train_date, wr, precision_score, trades_per_day, threshold,
-             sample_count, path, metadata_json),
+            (slot, train_date, wr, precision_score, trades_per_day, threshold, sample_count, path, metadata_json),
         )
         await db.commit()
         return cursor.lastrowid
 
 
 async def get_model_registry(slot: str = "current") -> dict | None:
-    """Return the most recent model_registry row for the given slot."""
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(

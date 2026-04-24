@@ -40,6 +40,8 @@ from bot.formatters import (
     format_set_down_threshold,
     format_signal_stats,
     format_status,
+    format_threshold_analytics,
+    format_threshold_policy_dashboard,
     format_trade_stats,
 )
 from bot.keyboards import (
@@ -54,6 +56,9 @@ from bot.keyboards import (
     retrain_blocked_keyboard,
     settings_keyboard,
     signal_filter_row,
+    threshold_menu,
+    threshold_mode_keyboard,
+    threshold_policy_choice_keyboard,
     trade_filter_row,
 )
 from bot.middleware import auth_check
@@ -61,12 +66,10 @@ from db import queries
 from polymarket import account as pm_account
 
 log = logging.getLogger(__name__)
-
 MAX_ML_THRESHOLD = 0.95
 
 
 def _parse_ml_threshold(raw: str) -> float:
-    """Parse a Telegram ML threshold, allowing any numeric value up to MAX_ML_THRESHOLD."""
     threshold = float(raw)
     if threshold > MAX_ML_THRESHOLD:
         raise ValueError("out of range")
@@ -74,13 +77,8 @@ def _parse_ml_threshold(raw: str) -> float:
 
 
 def _parse_blocked_ranges(raw: str) -> list[tuple[float, float]] | None:
-    """Parse a Telegram argument like '0.20-0.22,0.40-0.42' into range tuples.
-
-    Returns None if the input is invalid (caller should show usage).
-    """
     ranges: list[tuple[float, float]] = []
     if not raw or not raw.strip() or raw.strip().lower() == "none":
-        # Empty string / "none" → clear all ranges
         return ranges
     for part in raw.split(","):
         part = part.strip()
@@ -99,7 +97,14 @@ def _parse_blocked_ranges(raw: str) -> list[tuple[float, float]] | None:
         ranges.append((lo, hi))
     return ranges
 
-# Set at startup by main.py
+
+def _parse_threshold_bucket(raw: str) -> str:
+    bucket = queries.truncate_probability_bucket(raw)
+    if bucket is None:
+        raise ValueError("invalid bucket")
+    return bucket
+
+
 _start_time: datetime = datetime.now(timezone.utc)
 _poly_client: Any = None
 
@@ -124,24 +129,13 @@ def _uptime() -> str:
     return f"{minutes}m"
 
 
-# ---------------------------------------------------------------------------
-# Safe edit helper — silently ignores 'Message is not modified' errors
-# ---------------------------------------------------------------------------
-
 async def _safe_edit(query, text, reply_markup=None, parse_mode="HTML"):
-    """Edit a message, silently ignoring 'not modified' errors."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
-        if "not modified" in str(e).lower():
-            pass  # Content unchanged — not an error
-        else:
+        if "not modified" not in str(e).lower():
             raise
 
-
-# ---------------------------------------------------------------------------
-# /start
-# ---------------------------------------------------------------------------
 
 @auth_check
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,10 +147,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=main_menu(), parse_mode="HTML")
 
 
-# ---------------------------------------------------------------------------
-# /status
-# ---------------------------------------------------------------------------
-
 @auth_check
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     connected = False
@@ -166,7 +156,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         connected = await pm_account.get_connection_status(_poly_client)
         balance = await pm_account.get_balance(_poly_client)
         positions = await pm_account.get_open_positions(_poly_client)
-
     autotrade = await queries.is_autotrade_enabled()
     auto_redeem = await queries.is_auto_redeem_enabled()
     trade_amount = await queries.get_trade_amount()
@@ -174,8 +163,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     last_sig_str = None
     if last_sig:
         ss = last_sig["slot_start"].split(" ")[-1] if " " in last_sig["slot_start"] else last_sig["slot_start"]
-        last_sig_str = f"{ss} UTC ({last_sig['side']})"
-
+        last_sig_str = f"{ss} UTC ({last_sig.get('model_side') or last_sig['side']})"
     demo_trade = await queries.is_demo_trade_enabled()
     demo_bankroll = await queries.get_demo_bankroll() if demo_trade else None
     trade_mode = await queries.get_trade_mode()
@@ -198,15 +186,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=back_to_menu())
     else:
-        target = update.message
-        if target is None:
-            return
-        await target.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
+        await update.message.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
 
-
-# ---------------------------------------------------------------------------
-# /signals
-# ---------------------------------------------------------------------------
 
 async def _render_signals(update: Update, limit: int | None, active: str) -> None:
     stats = await queries.get_signal_stats(limit=limit)
@@ -227,10 +208,6 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _render_signals(update, limit=None, active="all")
 
 
-# ---------------------------------------------------------------------------
-# /trades
-# ---------------------------------------------------------------------------
-
 async def _render_trades(update: Update, limit: int | None, active: str) -> None:
     stats = await queries.get_trade_stats(limit=limit)
     label = {"10": "Last 10", "50": "Last 50", "all": "All Time"}[active]
@@ -250,10 +227,6 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _render_trades(update, limit=None, active="all")
 
 
-# ---------------------------------------------------------------------------
-# /settings
-# ---------------------------------------------------------------------------
-
 @auth_check
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autotrade = await queries.is_autotrade_enabled()
@@ -263,7 +236,6 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     trade_pct = await queries.get_trade_pct()
     demo_trade = await queries.is_demo_trade_enabled()
     demo_bankroll = await queries.get_demo_bankroll()
-    invert_trades = await queries.is_invert_trades_enabled()
     ml_volatility_gate_enabled = await queries.get_ml_volatility_gate_enabled()
     at_text = "ON" if autotrade else "OFF"
     mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${trade_amount:.2f}"
@@ -271,19 +243,16 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = (
         f"\u2699\ufe0f <b>Settings</b>\n"
         f"AutoTrade: {at_text}  |  Mode: {mode_summary}  |  Demo: {dt_text}\n"
-        f"Invert trades: {'ON' if invert_trades else 'OFF'}  |  ML volatility gate: {'ON' if ml_volatility_gate_enabled else 'OFF'}"
+        f"Threshold routing is active per bucket. Legacy global invert now only acts as real-mode fallback for FOLLOW buckets.\n"
+        f"ML volatility gate: {'ON' if ml_volatility_gate_enabled else 'OFF'}"
     )
-    kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, trade_pct, invert_trades, ml_volatility_gate_enabled)
+    kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, trade_pct, False, ml_volatility_gate_enabled)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=kb)
     else:
         await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
-
-# ---------------------------------------------------------------------------
-# /help
-# ---------------------------------------------------------------------------
 
 @auth_check
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,15 +264,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
 
 
-# ---------------------------------------------------------------------------
-# /redeem — manual redemption (dry-run preview then confirm)
-# ---------------------------------------------------------------------------
-
 @auth_check
 async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Step 1: dry-run scan — show what would be redeemed, await confirmation."""
     from core.redeemer import scan_and_redeem
-
     wallet = cfg.POLYMARKET_FUNDER_ADDRESS
     if not wallet:
         text = "\u274c <b>Redeem Error</b>\n\nPOLYMARKET_FUNDER_ADDRESS is not configured."
@@ -313,16 +276,13 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
         return
-
-    # Show scanning message first
     scanning_text = "\U0001f50d <b>Scanning wallet for redeemable positions...</b>"
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, scanning_text)
-        sent = None  # edits are done via callback_query
+        sent = None
     else:
         sent = await update.message.reply_text(scanning_text, parse_mode="HTML")
-
     try:
         results = await scan_and_redeem(wallet, dry_run=True)
     except Exception:
@@ -333,22 +293,14 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             await sent.edit_text(error_text, parse_mode="HTML", reply_markup=back_to_menu())
         return
-
-    # Store dry-run results in user_data for the confirm step
     context.user_data["redeem_preview"] = results
-
     text = format_redeem_preview(results)
     kb = redeem_confirm_keyboard() if results else back_to_menu()
-
     if update.callback_query:
         await _safe_edit(update.callback_query, text, reply_markup=kb)
     else:
         await sent.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-
-# ---------------------------------------------------------------------------
-# /redemptions — history dashboard
-# ---------------------------------------------------------------------------
 
 @auth_check
 async def cmd_redemptions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -362,18 +314,18 @@ async def cmd_redemptions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
 
 
-# ---------------------------------------------------------------------------
-# Download handlers
-# ---------------------------------------------------------------------------
-
 @auth_check
 async def cmd_download_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Export all signals as a CSV file (filter_blocked column removed — always was 0)."""
     query = update.callback_query
     await query.answer("Preparing CSV...")
     rows = await queries.get_all_signals_for_export()
+    fieldnames = [
+        "id", "slot_start", "side", "model_side", "entry_price", "is_win", "pattern",
+        "ml_p_up", "ml_p_down", "ml_probability_bucket", "ml_probability_used",
+        "threshold_policy_real", "threshold_policy_demo",
+    ]
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id", "slot_start", "side", "entry_price", "is_win", "pattern"])
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)
     buf.seek(0)
@@ -386,16 +338,20 @@ async def cmd_download_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @auth_check
 async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Export all signals as an Excel file (filter_blocked column removed — always was 0)."""
     query = update.callback_query
     await query.answer("Preparing Excel...")
     rows = await queries.get_all_signals_for_export()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Signals"
-    ws.append(["id", "slot_start", "side", "entry_price", "is_win", "pattern"])
+    headers = [
+        "id", "slot_start", "side", "model_side", "entry_price", "is_win", "pattern",
+        "ml_p_up", "ml_p_down", "ml_probability_bucket", "ml_probability_used",
+        "threshold_policy_real", "threshold_policy_demo",
+    ]
+    ws.append(headers)
     for r in rows:
-        ws.append([r["id"], r["slot_start"], r["side"], r["entry_price"], r["is_win"], r.get("pattern", "")])
+        ws.append([r.get(h) for h in headers])
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -405,11 +361,6 @@ async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         caption="\U0001f4e5 All signals export (Excel)",
     )
 
-
-
-# ---------------------------------------------------------------------------
-# /patterns — per-pattern performance dashboard
-# ---------------------------------------------------------------------------
 
 @auth_check
 async def cmd_patterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -425,21 +376,16 @@ async def cmd_patterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 @auth_check
 async def cmd_download_pattern_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Export per-pattern stats as an Excel file."""
     query = update.callback_query
     await query.answer("Preparing Excel...")
     rows = await queries.get_pattern_stats_for_export()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Patterns"
-    ws.append([
-        "Pattern", "Total Trades", "Wins", "Losses",
-        "Win%", "W/L Ratio", "Deployed USDC", "Net PnL", "ROI%", "Last Seen",
-    ])
+    ws.append(["Pattern", "Total Trades", "Wins", "Losses", "Win%", "W/L Ratio", "Deployed USDC", "Net PnL", "ROI%", "Last Seen"])
     for r in rows:
         ws.append([
-            r["pattern"], r["total_trades"], r["wins"], r["losses"],
-            r["win_pct"],
+            r["pattern"], r["total_trades"], r["wins"], r["losses"], r["win_pct"],
             r["wl_ratio"] if r["wl_ratio"] != float("inf") else "inf",
             r["total_deployed"], r["net_pnl"], r["roi_pct"], r["last_seen"],
         ])
@@ -452,581 +398,6 @@ async def cmd_download_pattern_excel(update: Update, context: ContextTypes.DEFAU
         caption="\U0001f4e5 Per-pattern stats export (Excel)",
     )
 
-
-# ---------------------------------------------------------------------------
-# Callback query router
-# ---------------------------------------------------------------------------
-
-@auth_check
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    data = query.data
-
-    if data == "cmd_menu":
-        await query.answer()
-        text = "\U0001f916 <b>AutoPoly Menu</b>\n\nSelect an option:"
-        await _safe_edit(query, text, reply_markup=main_menu())
-
-    elif data == "cmd_status":
-        await cmd_status(update, context)
-
-    elif data == "cmd_signals":
-        await _render_signals(update, limit=None, active="all")
-
-    elif data == "cmd_trades":
-        await _render_trades(update, limit=None, active="all")
-
-    elif data == "cmd_settings":
-        await cmd_settings(update, context)
-
-    elif data == "cmd_help":
-        await cmd_help(update, context)
-
-    elif data == "cmd_redeem":
-        await cmd_redeem(update, context)
-
-    elif data == "cmd_redemptions":
-        await cmd_redemptions(update, context)
-
-    # Signal filters
-    elif data == "signals_10":
-        await _render_signals(update, limit=10, active="10")
-    elif data == "signals_50":
-        await _render_signals(update, limit=50, active="50")
-    elif data == "signals_all":
-        await _render_signals(update, limit=None, active="all")
-
-    # Trade filters
-    elif data == "trades_10":
-        await _render_trades(update, limit=10, active="10")
-    elif data == "trades_50":
-        await _render_trades(update, limit=50, active="50")
-    elif data == "trades_all":
-        await _render_trades(update, limit=None, active="all")
-
-    # Settings toggles
-    elif data == "toggle_autotrade":
-        current = await queries.is_autotrade_enabled()
-        await queries.set_setting("autotrade_enabled", "false" if current else "true")
-        new_state = "OFF" if current else "ON"
-        await query.answer(f"AutoTrade {new_state}")
-        await cmd_settings(update, context)
-
-    elif data == "toggle_auto_redeem":
-        current = await queries.is_auto_redeem_enabled()
-        await queries.set_setting("auto_redeem_enabled", "false" if current else "true")
-        new_state = "ON" if not current else "OFF"
-        await query.answer(f"Auto-Redeem {new_state}")
-        await cmd_settings(update, context)
-
-    elif data == "toggle_trade_mode":
-        current_mode = await queries.get_trade_mode()
-        new_mode = "pct" if current_mode == "fixed" else "fixed"
-        await queries.set_setting("trade_mode", new_mode)
-        await query.answer(f"Trade mode switched to {new_mode.upper()}")
-        await cmd_settings(update, context)
-
-    elif data == "change_amount":
-        await query.answer()
-        trade_mode = await queries.get_trade_mode()
-        trade_pct = await queries.get_trade_pct()
-        trade_amount = await queries.get_trade_amount()
-        if trade_mode == "pct":
-            await _safe_edit(
-                query,
-                f"\U0001f522 <b>Set Trade Percentage</b>\n\n"
-                f"Current: <b>{trade_pct:.1f}%</b>\n\n"
-                "Type the percentage to use per trade (e.g. <code>5</code> for 5%).\n"
-                "<i>Minimum trade is always $1.00 (Polymarket limit).</i>",
-            )
-            context.user_data["awaiting_trade_pct"] = True
-        else:
-            await _safe_edit(
-                query,
-                f"\U0001f4b5 <b>Set Trade Amount</b>\n\n"
-                f"Current: <b>${trade_amount:.2f}</b>\n\n"
-                "Type the new amount in USDC (e.g. <code>2.50</code>):",
-            )
-            context.user_data["awaiting_amount"] = True
-
-    elif data == "download_csv":
-        await cmd_download_csv(update, context)
-
-    elif data == "download_xlsx":
-        await cmd_download_excel(update, context)
-
-    # Redeem confirm / cancel
-    elif data == "redeem_confirm":
-        await _handle_redeem_confirm(update, context)
-
-    elif data == "redeem_cancel":
-        context.user_data.pop("redeem_preview", None)
-        await query.answer("Cancelled.")
-        await _safe_edit(
-            query,
-            "\u274c Redemption cancelled.",
-            reply_markup=back_to_menu(),
-        )
-
-    elif data == "toggle_demo_trade":
-        current = await queries.is_demo_trade_enabled()
-        await queries.set_setting("demo_trade_enabled", "false" if current else "true")
-        new_state = "OFF" if current else "ON"
-        await query.answer(f"Demo Trade {new_state}")
-        await cmd_settings(update, context)
-
-    elif data == "set_demo_bankroll":
-        await query.answer()
-        demo_bankroll = await queries.get_demo_bankroll()
-        await _safe_edit(
-            query,
-            f"\U0001f4b0 <b>Set Demo Bankroll</b>\n\n"
-            f"Current balance: <b>${demo_bankroll:.2f}</b>\n\n"
-            "Type the new bankroll amount in USDC (e.g. <code>500.00</code>):",
-        )
-        context.user_data["awaiting_demo_bankroll"] = True
-
-    elif data == "reset_demo_bankroll":
-        await queries.reset_demo_bankroll(1000.00)
-        await query.answer("Demo bankroll reset to $1000.00")
-        await cmd_settings(update, context)
-
-    elif data == "toggle_invert_trades":
-        current = await queries.is_invert_trades_enabled()
-        await queries.set_setting("invert_trades_enabled", "false" if current else "true")
-        new_state = "OFF" if current else "ON"
-        await query.answer(f"Invert Trades {new_state}")
-        await cmd_settings(update, context)
-
-    elif data == "toggle_ml_volatility_gate":
-        gate_enabled = await queries.get_ml_volatility_gate_enabled()
-        if gate_enabled:
-            await query.answer()
-            await _safe_edit(
-                query,
-                "\u26a0 <b>Disable ML volatility gate?</b>\n\n"
-                "Recommended: keep this enabled. Disabling it bypasses the live volatility regime safety check for ML signals only.\n\n"
-                "Tap <b>Disable Gate</b> to confirm, or keep it enabled.",
-                reply_markup=ml_volatility_gate_confirm_keyboard(),
-            )
-        else:
-            await queries.set_ml_volatility_gate_enabled(True)
-            await query.answer("ML volatility gate ON")
-            await cmd_settings(update, context)
-
-    elif data == "confirm_disable_ml_volatility_gate":
-        await queries.set_ml_volatility_gate_enabled(False)
-        await query.answer("ML volatility gate OFF")
-        await cmd_settings(update, context)
-
-    elif data == "cancel_disable_ml_volatility_gate":
-        await query.answer("ML volatility gate kept ON")
-        await cmd_settings(update, context)
-
-    elif data == "cmd_demo":
-        await _render_demo_stats(update, active="all")
-
-    elif data == "demo_10":
-        await _render_demo_stats(update, limit=10, active="10")
-
-    elif data == "demo_50":
-        await _render_demo_stats(update, limit=50, active="50")
-
-    elif data == "demo_all":
-        await _render_demo_stats(update, limit=None, active="all")
-
-    elif data == "cmd_patterns":
-        await cmd_patterns(update, context)
-
-    elif data == "download_pattern_xlsx":
-        await cmd_download_pattern_excel(update, context)
-
-    # ML Model submenu
-    elif data == "cmd_ml":
-        await query.answer()
-        await _safe_edit(
-            query,
-            "\U0001f916 <b>ML Model</b>\n\nManage the ML inference model, compare versions, retrain, or adjust the signal threshold.",
-            reply_markup=ml_menu(),
-        )
-
-    elif data == "ml_status":
-        await query.answer()
-        await cmd_model_status(update, context)
-
-    elif data == "ml_compare":
-        await query.answer()
-        await cmd_model_compare(update, context)
-
-    elif data == "ml_promote":
-        await query.answer()
-        await cmd_promote_model(update, context)
-
-    elif data == "ml_retrain":
-        await query.answer()
-        await cmd_retrain(update, context)
-
-    elif data == "ml_promote_anyway":
-        # Answer immediately with cache_time to suppress Telegram re-fires on double-tap
-        await query.answer("Promoting...", cache_time=10)
-        from ml import model_store
-        from core.strategies.ml_strategy import request_model_reload, set_model as _set_model
-        if not model_store.has_model("candidate"):
-            await query.message.reply_text(
-                "&#x274C; No candidate model found. Please retrain first.\n"
-                "<i>(If you already promoted, the candidate was consumed.)</i>",
-                parse_mode="HTML",
-                reply_markup=ml_menu(),
-            )
-        else:
-            # Promote on disk first, then persist to DB so it survives container restarts
-            model_store.promote_candidate()
-            try:
-                await model_store.promote_candidate_in_db()
-            except Exception:
-                log.exception("ml_promote_anyway: failed to persist promotion to DB (disk promote succeeded)")
-            # Inject the newly promoted model into the strategy before requesting reload
-            try:
-                promoted = await model_store.load_model_from_db("current")
-                if promoted:
-                    _set_model(promoted)
-            except Exception:
-                log.exception("ml_promote_anyway: failed to preload promoted model into strategy (non-fatal)")
-            request_model_reload()
-            meta = model_store.load_metadata("current") or {}
-            threshold = await queries.get_ml_threshold()
-            text = format_model_status("current (force-promoted)", meta, threshold)
-            await query.message.reply_text(
-                f"{text}\n\n&#x26A0;&#xFE0F; Candidate promoted despite failing the 59% gate. "
-                "Monitor live performance closely.",
-                parse_mode="HTML",
-                reply_markup=ml_menu(),
-            )
-            # If the DOWN side did not pass its own gate, ask the user whether to
-            # enable it anyway via the override keyboard.
-            if not meta.get("down_enabled", True):
-                down_val_wr = meta.get("down_val_wr", 0.0)
-                down_test_wr = meta.get("down_test_wr", 0.0)
-                down_thr = meta.get("down_threshold", "n/a")
-                await query.message.reply_text(
-                    f"\u2139\ufe0f <b>DOWN signal did not pass the 59\u202f% gate</b>\n\n"
-                    f"Val win-rate: <b>{down_val_wr:.1%}</b>  |  "
-                    f"Test win-rate: <b>{down_test_wr:.1%}</b>  |  "
-                    f"Threshold: <b>{down_thr}</b>\n\n"
-                    "Do you want to enable the DOWN signal anyway, or keep it disabled?",
-                    parse_mode="HTML",
-                    reply_markup=down_override_keyboard(),
-                )
-
-    elif data == "ml_discard_candidate":
-        await query.answer()
-        # User chose to discard the blocked candidate
-        from ml import model_store
-        if model_store.has_model("candidate"):
-            model_store.delete_model("candidate")
-        await _safe_edit(
-            query,
-            "\U0001f5d1 <b>Candidate discarded.</b>\n\n"
-            "The blocked candidate has been removed. "
-            "The current production model is unchanged.",
-            reply_markup=ml_menu(),
-        )
-
-    elif data == "ml_down_override_anyway":
-        await query.answer("DOWN signal enabled.", cache_time=10)
-        from ml import model_store
-        # Patch the on-disk metadata so ml_strategy picks up down_override=True
-        model_store.patch_metadata("current", {"down_override": True})
-        # Also patch DB metadata so the flag survives container restarts
-        try:
-            import aiosqlite
-            import config as cfg
-            import json as _json
-            async with aiosqlite.connect(cfg.DB_PATH) as _db:
-                _cur = await _db.execute(
-                    "SELECT metadata FROM model_blobs WHERE slot = ?", ("current",)
-                )
-                _row = await _cur.fetchone()
-                if _row:
-                    _meta = _json.loads(_row[0])
-                    _meta["down_override"] = True
-                    await _db.execute(
-                        "UPDATE model_blobs SET metadata = ?, updated_at = CURRENT_TIMESTAMP "
-                        "WHERE slot = ?",
-                        (_json.dumps(_meta), "current"),
-                    )
-                    await _db.commit()
-        except Exception:
-            log.exception("ml_down_override_anyway: failed to patch DB metadata (non-fatal)")
-        await query.message.reply_text(
-            "\u2705 <b>DOWN signal override enabled.</b>\n\n"
-            "The DOWN model will fire on the next signal check even though it did not "
-            "pass the 59\u202f% gate. Monitor performance closely.",
-            parse_mode="HTML",
-            reply_markup=ml_menu(),
-        )
-
-    elif data == "ml_down_override_skip":
-        await query.answer("DOWN signal kept disabled.")
-        from ml import model_store
-        # Explicitly mark down_override=False so intent is clear in metadata
-        model_store.patch_metadata("current", {"down_override": False})
-        await query.message.reply_text(
-            "\u274c <b>DOWN signal remains disabled.</b>\n\n"
-            "The UP model is live. The DOWN side will not fire until a retrain "
-            "produces a candidate that passes its own 59\u202f% gate.",
-            parse_mode="HTML",
-            reply_markup=ml_menu(),
-        )
-
-    elif data == "ml_set_threshold":
-        await query.answer()
-        threshold = await queries.get_ml_threshold()
-        await _safe_edit(
-            query,
-            f"\u2699\ufe0f <b>Set ML Threshold</b>\n\nCurrent threshold: <b>{threshold:.3f}</b>\n\n"
-            f"Type the new threshold value (up to {MAX_ML_THRESHOLD:.2f}):\n"
-            "Example: <code>0.56</code>",
-        )
-        context.user_data["awaiting_ml_threshold"] = True
-
-    elif data == "ml_set_down_threshold":
-        await query.answer()
-        threshold = await queries.get_ml_down_threshold()
-        await _safe_edit(
-            query,
-            f"\u2699\ufe0f <b>Set ML DOWN Threshold</b>\n\nCurrent DOWN threshold: <b>{threshold:.3f}</b>\n\n"
-            f"Type the new DOWN threshold value (up to {MAX_ML_THRESHOLD:.2f}):\n"
-            "Example: <code>0.55</code>",
-        )
-        context.user_data["awaiting_ml_down_threshold"] = True
-
-    else:
-        await query.answer("Unknown action")
-
-
-async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Execute redemptions after user confirmed the dry-run preview."""
-    from core.redeemer import redeem_position
-
-    query = update.callback_query
-    await query.answer("Executing redemptions...")
-
-    # Retrieve and immediately clear the stored preview
-    preview = context.user_data.pop("redeem_preview", None)
-
-    if not preview:
-        await _safe_edit(
-            query,
-            "\u274c <b>Nothing to redeem</b>\n\nThe preview has expired or no positions were found. "
-            "Run /redeem again to rescan.",
-            reply_markup=back_to_menu(),
-        )
-        return
-
-    won_count  = sum(1 for p in preview if p.get("won"))
-    lost_count = len(preview) - won_count
-    await _safe_edit(
-        query,
-        f"\u23f3 <b>Executing {len(preview)} redemption(s) on-chain...</b>\n"
-        f"Won: {won_count}  Lost (burn): {lost_count}\n\nThis may take up to 2 minutes.",
-    )
-
-    wallet = cfg.POLYMARKET_FUNDER_ADDRESS
-    if not wallet:
-        await _safe_edit(
-            query,
-            "\u274c POLYMARKET_FUNDER_ADDRESS not configured.",
-            reply_markup=back_to_menu(),
-        )
-        return
-
-    results: list[dict] = []
-    for pos in preview:
-        result = await redeem_position(pos["condition_id"])
-        merged = {**pos, **result, "dry_run": False}
-        results.append(merged)
-
-        # Persist each result to DB immediately (even if failed)
-        try:
-            await queries.insert_redemption(
-                condition_id=pos["condition_id"],
-                outcome_index=pos["outcome_index"],
-                size=pos["size"],
-                title=pos.get("title"),
-                tx_hash=result.get("tx_hash"),
-                status="success" if result.get("success") else "failed",
-                error=result.get("error"),
-                gas_used=result.get("gas_used"),
-                dry_run=False,
-            )
-        except Exception:
-            log.exception("Failed to persist redemption record for condition=%s", pos.get("condition_id"))
-
-    text = format_redeem_results(results)
-    await _safe_edit(query, text, reply_markup=redeem_done_keyboard())
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # -- Trade percentage input ----------------------------------------------------
-    if context.user_data.get("awaiting_trade_pct"):
-        context.user_data["awaiting_trade_pct"] = False
-        raw = update.message.text.strip().replace("%", "")
-        try:
-            pct = float(raw)
-            if pct <= 0 or pct > 100:
-                raise ValueError("out of range")
-        except ValueError:
-            await update.message.reply_text(
-                "\u274c Invalid percentage. Please enter a number between 0.1 and 100 (e.g. <code>5</code>).",
-                parse_mode="HTML",
-            )
-            return
-        pct = round(pct, 2)
-        await queries.set_setting("trade_pct", str(pct))
-        await update.message.reply_text(
-            f"\u2705 Trade percentage set to <b>{pct:.2f}%</b>\n"
-            f"<i>Minimum trade is always $1.00 (Polymarket limit).</i>",
-            parse_mode="HTML",
-        )
-        # Refresh settings panel
-        autotrade = await queries.is_autotrade_enabled()
-        auto_redeem = await queries.is_auto_redeem_enabled()
-        trade_amount = await queries.get_trade_amount()
-        trade_mode = await queries.get_trade_mode()
-        demo_trade = await queries.is_demo_trade_enabled()
-        demo_bankroll = await queries.get_demo_bankroll()
-        invert_trades = await queries.is_invert_trades_enabled()
-        ml_volatility_gate_enabled = await queries.get_ml_volatility_gate_enabled()
-        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, pct, invert_trades, ml_volatility_gate_enabled)
-        await update.message.reply_text(
-            f"\u2699\ufe0f <b>Settings</b>\nAutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {'PCT' if trade_mode == 'pct' else 'FIXED'} {pct}%  |  Demo: {'ON' if demo_trade else 'OFF'}",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
-        return
-
-    # -- Demo bankroll input -------------------------------------------------------
-    if context.user_data.get("awaiting_demo_bankroll"):
-        context.user_data["awaiting_demo_bankroll"] = False
-        raw = update.message.text.strip().replace("$", "")
-        try:
-            amount = float(raw)
-            if amount < 0:
-                raise ValueError("negative")
-        except ValueError:
-            await update.message.reply_text(
-                "\u274c Invalid amount. Please enter a non-negative number (e.g. 500.00)."
-            )
-            return
-        amount = round(amount, 2)
-        await queries.set_demo_bankroll(amount)
-        await update.message.reply_text(
-            f"\u2705 Demo bankroll set to <b>${amount:.2f}</b>",
-            parse_mode="HTML",
-        )
-        # Refresh settings panel
-        autotrade = await queries.is_autotrade_enabled()
-        auto_redeem = await queries.is_auto_redeem_enabled()
-        trade_mode = await queries.get_trade_mode()
-        trade_pct = await queries.get_trade_pct()
-        demo_trade = await queries.is_demo_trade_enabled()
-        trade_amount = await queries.get_trade_amount()
-        invert_trades = await queries.is_invert_trades_enabled()
-        ml_volatility_gate_enabled = await queries.get_ml_volatility_gate_enabled()
-        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, amount, trade_mode, trade_pct, invert_trades, ml_volatility_gate_enabled)
-        mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${trade_amount:.2f}"
-        await update.message.reply_text(
-            f"\u2699\ufe0f <b>Settings</b>\nAutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {mode_summary}  |  Demo: {'ON' if demo_trade else 'OFF'}",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
-        return
-
-    # -- ML threshold input -------------------------------------------------------
-    if context.user_data.get("awaiting_ml_threshold"):
-        context.user_data["awaiting_ml_threshold"] = False
-        raw = update.message.text.strip()
-        try:
-            threshold = _parse_ml_threshold(raw)
-        except ValueError:
-            await update.message.reply_text(
-                f"\u274c Invalid value. Enter a number up to {MAX_ML_THRESHOLD:.2f} (e.g. <code>0.56</code>).",
-                parse_mode="HTML",
-            )
-            return
-        await queries.set_ml_threshold(threshold)
-        await update.message.reply_text(
-            f"\u2705 ML threshold set to <b>{threshold:.3f}</b>. Active on next signal check.",
-            parse_mode="HTML",
-            reply_markup=ml_menu(),
-        )
-        return
-
-    # -- ML DOWN threshold input ---------------------------------------------------
-    if context.user_data.get("awaiting_ml_down_threshold"):
-        context.user_data["awaiting_ml_down_threshold"] = False
-        raw = update.message.text.strip()
-        try:
-            threshold = _parse_ml_threshold(raw)
-        except ValueError:
-            await update.message.reply_text(
-                f"\u274c Invalid value. Enter a number up to {MAX_ML_THRESHOLD:.2f} (e.g. <code>0.55</code>).",
-                parse_mode="HTML",
-            )
-            return
-        await queries.set_ml_down_threshold(threshold)
-        await update.message.reply_text(
-            f"\u2705 ML DOWN threshold set to <b>{threshold:.3f}</b>. Active on next signal check.",
-            parse_mode="HTML",
-            reply_markup=ml_menu(),
-        )
-        return
-
-    # -- Trade amount input --------------------------------------------------------
-    if not context.user_data.get("awaiting_amount"):
-        return
-
-    context.user_data["awaiting_amount"] = False
-    raw = update.message.text.strip().replace("$", "")
-    try:
-        amount = float(raw)
-        if amount <= 0:
-            raise ValueError("non-positive")
-    except ValueError:
-        await update.message.reply_text(
-            "\u274c Invalid amount. Please enter a positive number (e.g. 2.50)."
-        )
-        return
-
-    amount = round(amount, 2)
-    await queries.set_setting("trade_amount_usdc", str(amount))
-    await update.message.reply_text(
-        f"\u2705 Trade amount updated to <b>${amount:.2f}</b>",
-        parse_mode="HTML",
-    )
-    # Show settings panel again
-    autotrade = await queries.is_autotrade_enabled()
-    auto_redeem = await queries.is_auto_redeem_enabled()
-    trade_mode = await queries.get_trade_mode()
-    trade_pct = await queries.get_trade_pct()
-    demo_trade = await queries.is_demo_trade_enabled()
-    demo_bankroll = await queries.get_demo_bankroll()
-    invert_trades = await queries.is_invert_trades_enabled()
-    ml_volatility_gate_enabled = await queries.get_ml_volatility_gate_enabled()
-    mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${amount:.2f}"
-    kb = settings_keyboard(autotrade, amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, trade_pct, invert_trades, ml_volatility_gate_enabled)
-    await update.message.reply_text(
-        f"\u2699\ufe0f <b>Settings</b>\n"
-        f"AutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {mode_summary}  |  Demo: {'ON' if demo_trade else 'OFF'}\n"
-        f"Invert trades: {'ON' if invert_trades else 'OFF'}  |  ML volatility gate: {'ON' if ml_volatility_gate_enabled else 'OFF'}",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# /demo — Demo trade performance dashboard
-# ---------------------------------------------------------------------------
 
 async def _render_demo_stats(update: Update, limit: int | None = None, active: str = "all") -> None:
     from bot.keyboards import demo_filter_row
@@ -1049,31 +420,351 @@ async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_demo_stats(update, limit=None, active="all")
 
 
-# ---------------------------------------------------------------------------
-# Register all handlers
-# ---------------------------------------------------------------------------
+@auth_check
+async def cmd_thresholds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "<b>Threshold Routing</b>\nPer-bucket policies are stored separately for real and demo. Unspecified buckets default to FOLLOW."
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=threshold_menu())
+    else:
+        await update.message.reply_text(text, reply_markup=threshold_menu(), parse_mode="HTML")
+
+
+async def _render_threshold_policies(update: Update, mode: str) -> None:
+    rows = await queries.list_threshold_policies(mode=mode)
+    text = format_threshold_policy_dashboard(mode, rows)
+    kb = threshold_mode_keyboard(mode)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@auth_check
+async def cmd_threshold_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mode = "real"
+    if context.args and context.args[0].lower() in {"real", "demo"}:
+        mode = context.args[0].lower()
+    rows = await queries.get_threshold_stats(mode)
+    text = format_threshold_analytics(mode, rows)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=threshold_menu())
+    else:
+        await update.message.reply_text(text, reply_markup=threshold_menu(), parse_mode="HTML")
+
+
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    if data == "cmd_menu":
+        await query.answer()
+        await _safe_edit(query, "\U0001f916 <b>AutoPoly Menu</b>\n\nSelect an option:", reply_markup=main_menu())
+    elif data == "cmd_status":
+        await cmd_status(update, context)
+    elif data == "cmd_signals":
+        await _render_signals(update, limit=None, active="all")
+    elif data == "cmd_trades":
+        await _render_trades(update, limit=None, active="all")
+    elif data == "cmd_settings":
+        await cmd_settings(update, context)
+    elif data == "cmd_help":
+        await cmd_help(update, context)
+    elif data == "cmd_redeem":
+        await cmd_redeem(update, context)
+    elif data == "cmd_redemptions":
+        await cmd_redemptions(update, context)
+    elif data == "signals_10":
+        await _render_signals(update, limit=10, active="10")
+    elif data == "signals_50":
+        await _render_signals(update, limit=50, active="50")
+    elif data == "signals_all":
+        await _render_signals(update, limit=None, active="all")
+    elif data == "trades_10":
+        await _render_trades(update, limit=10, active="10")
+    elif data == "trades_50":
+        await _render_trades(update, limit=50, active="50")
+    elif data == "trades_all":
+        await _render_trades(update, limit=None, active="all")
+    elif data == "toggle_autotrade":
+        current = await queries.is_autotrade_enabled()
+        await queries.set_setting("autotrade_enabled", "false" if current else "true")
+        await query.answer(f"AutoTrade {'OFF' if current else 'ON'}")
+        await cmd_settings(update, context)
+    elif data == "toggle_auto_redeem":
+        current = await queries.is_auto_redeem_enabled()
+        await queries.set_setting("auto_redeem_enabled", "false" if current else "true")
+        await query.answer(f"Auto-Redeem {'OFF' if current else 'ON'}")
+        await cmd_settings(update, context)
+    elif data == "toggle_trade_mode":
+        current_mode = await queries.get_trade_mode()
+        new_mode = "pct" if current_mode == "fixed" else "fixed"
+        await queries.set_setting("trade_mode", new_mode)
+        await query.answer(f"Trade mode switched to {new_mode.upper()}")
+        await cmd_settings(update, context)
+    elif data == "change_amount":
+        await query.answer()
+        trade_mode = await queries.get_trade_mode()
+        trade_pct = await queries.get_trade_pct()
+        trade_amount = await queries.get_trade_amount()
+        if trade_mode == "pct":
+            await _safe_edit(query, f"\U0001f522 <b>Set Trade Percentage</b>\n\nCurrent: <b>{trade_pct:.1f}%</b>\n\nType the percentage to use per trade.")
+            context.user_data["awaiting_trade_pct"] = True
+        else:
+            await _safe_edit(query, f"\U0001f4b5 <b>Set Trade Amount</b>\n\nCurrent: <b>${trade_amount:.2f}</b>\n\nType the new amount in USDC:")
+            context.user_data["awaiting_amount"] = True
+    elif data == "download_csv":
+        await cmd_download_csv(update, context)
+    elif data == "download_xlsx":
+        await cmd_download_excel(update, context)
+    elif data == "redeem_confirm":
+        await _handle_redeem_confirm(update, context)
+    elif data == "redeem_cancel":
+        context.user_data.pop("redeem_preview", None)
+        await query.answer("Cancelled.")
+        await _safe_edit(query, "\u274c Redemption cancelled.", reply_markup=back_to_menu())
+    elif data == "toggle_demo_trade":
+        current = await queries.is_demo_trade_enabled()
+        await queries.set_setting("demo_trade_enabled", "false" if current else "true")
+        await query.answer(f"Demo Trade {'OFF' if current else 'ON'}")
+        await cmd_settings(update, context)
+    elif data == "set_demo_bankroll":
+        await query.answer()
+        demo_bankroll = await queries.get_demo_bankroll()
+        await _safe_edit(query, f"\U0001f4b0 <b>Set Demo Bankroll</b>\n\nCurrent balance: <b>${demo_bankroll:.2f}</b>\n\nType the new bankroll amount in USDC:")
+        context.user_data["awaiting_demo_bankroll"] = True
+    elif data == "reset_demo_bankroll":
+        await queries.reset_demo_bankroll(1000.00)
+        await query.answer("Demo bankroll reset to $1000.00")
+        await cmd_settings(update, context)
+    elif data == "toggle_ml_volatility_gate":
+        gate_enabled = await queries.get_ml_volatility_gate_enabled()
+        if gate_enabled:
+            await query.answer()
+            await _safe_edit(query, "\u26a0 <b>Disable ML volatility gate?</b>", reply_markup=ml_volatility_gate_confirm_keyboard())
+        else:
+            await queries.set_ml_volatility_gate_enabled(True)
+            await query.answer("ML volatility gate ON")
+            await cmd_settings(update, context)
+    elif data == "confirm_disable_ml_volatility_gate":
+        await queries.set_ml_volatility_gate_enabled(False)
+        await query.answer("ML volatility gate OFF")
+        await cmd_settings(update, context)
+    elif data == "cancel_disable_ml_volatility_gate":
+        await query.answer("ML volatility gate kept ON")
+        await cmd_settings(update, context)
+    elif data == "cmd_demo":
+        await _render_demo_stats(update, active="all")
+    elif data == "demo_10":
+        await _render_demo_stats(update, limit=10, active="10")
+    elif data == "demo_50":
+        await _render_demo_stats(update, limit=50, active="50")
+    elif data == "demo_all":
+        await _render_demo_stats(update, limit=None, active="all")
+    elif data == "cmd_patterns":
+        await cmd_patterns(update, context)
+    elif data == "download_pattern_xlsx":
+        await cmd_download_pattern_excel(update, context)
+    elif data == "cmd_ml":
+        await query.answer()
+        await _safe_edit(query, "\U0001f916 <b>ML Model</b>", reply_markup=ml_menu())
+    elif data == "cmd_thresholds":
+        await cmd_thresholds(update, context)
+    elif data == "thresholds_real":
+        await _render_threshold_policies(update, "real")
+    elif data == "thresholds_demo":
+        await _render_threshold_policies(update, "demo")
+    elif data == "threshold_stats_real":
+        rows = await queries.get_threshold_stats("real")
+        await _safe_edit(query, format_threshold_analytics("real", rows), reply_markup=threshold_menu())
+    elif data == "threshold_stats_demo":
+        rows = await queries.get_threshold_stats("demo")
+        await _safe_edit(query, format_threshold_analytics("demo", rows), reply_markup=threshold_menu())
+    elif data.startswith("threshold_set_"):
+        mode = data.split("_")[-1]
+        context.user_data["awaiting_threshold_bucket"] = mode
+        await _safe_edit(query, f"Send the {mode} bucket to edit, for example <code>0.53</code>.", reply_markup=threshold_mode_keyboard(mode))
+    elif data.startswith("threshold_clear_"):
+        mode = data.split("_")[-1]
+        context.user_data["awaiting_threshold_clear_bucket"] = mode
+        await _safe_edit(query, f"Send the {mode} bucket to clear, for example <code>0.53</code>.", reply_markup=threshold_mode_keyboard(mode))
+    elif data.startswith("threshold_policy_"):
+        _, _, mode, bucket, policy = data.split("_", 4)
+        await queries.set_threshold_policy(bucket, mode, policy)
+        await query.answer(f"{mode} bucket {bucket} -> {policy}")
+        await _render_threshold_policies(update, mode)
+    elif data == "ml_status":
+        await query.answer(); await cmd_model_status(update, context)
+    elif data == "ml_compare":
+        await query.answer(); await cmd_model_compare(update, context)
+    elif data == "ml_promote":
+        await query.answer(); await cmd_promote_model(update, context)
+    elif data == "ml_retrain":
+        await query.answer(); await cmd_retrain(update, context)
+    elif data == "ml_set_threshold":
+        await query.answer(); await _safe_edit(query, f"\u2699\ufe0f <b>Set ML Threshold</b>\n\nCurrent threshold: <b>{await queries.get_ml_threshold():.3f}</b>")
+        context.user_data["awaiting_ml_threshold"] = True
+    elif data == "ml_set_down_threshold":
+        await query.answer(); await _safe_edit(query, f"\u2699\ufe0f <b>Set ML DOWN Threshold</b>\n\nCurrent DOWN threshold: <b>{(await queries.get_ml_down_threshold()) or 0.0:.3f}</b>")
+        context.user_data["awaiting_ml_down_threshold"] = True
+    else:
+        await query.answer("Unknown action")
+
+
+async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from core.redeemer import redeem_position
+    query = update.callback_query
+    await query.answer("Executing redemptions...")
+    preview = context.user_data.pop("redeem_preview", None)
+    if not preview:
+        await _safe_edit(query, "\u274c <b>Nothing to redeem</b>", reply_markup=back_to_menu())
+        return
+    wallet = cfg.POLYMARKET_FUNDER_ADDRESS
+    if not wallet:
+        await _safe_edit(query, "\u274c POLYMARKET_FUNDER_ADDRESS not configured.", reply_markup=back_to_menu())
+        return
+    results: list[dict] = []
+    for pos in preview:
+        result = await redeem_position(pos["condition_id"])
+        merged = {**pos, **result, "dry_run": False}
+        results.append(merged)
+        try:
+            await queries.insert_redemption(
+                condition_id=pos["condition_id"],
+                outcome_index=pos["outcome_index"],
+                size=pos["size"],
+                title=pos.get("title"),
+                tx_hash=result.get("tx_hash"),
+                status="success" if result.get("success") else "failed",
+                error=result.get("error"),
+                gas_used=result.get("gas_used"),
+                dry_run=False,
+            )
+        except Exception:
+            log.exception("Failed to persist redemption record for condition=%s", pos.get("condition_id"))
+    await _safe_edit(query, format_redeem_results(results), reply_markup=redeem_done_keyboard())
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("awaiting_trade_pct"):
+        context.user_data["awaiting_trade_pct"] = False
+        raw = update.message.text.strip().replace("%", "")
+        try:
+            pct = float(raw)
+            if pct <= 0 or pct > 100:
+                raise ValueError("out of range")
+        except ValueError:
+            await update.message.reply_text("\u274c Invalid percentage.", parse_mode="HTML")
+            return
+        pct = round(pct, 2)
+        await queries.set_setting("trade_pct", str(pct))
+        await update.message.reply_text(f"\u2705 Trade percentage set to <b>{pct:.2f}%</b>", parse_mode="HTML")
+        return
+
+    if context.user_data.get("awaiting_demo_bankroll"):
+        context.user_data["awaiting_demo_bankroll"] = False
+        raw = update.message.text.strip().replace("$", "")
+        try:
+            amount = float(raw)
+            if amount < 0:
+                raise ValueError("negative")
+        except ValueError:
+            await update.message.reply_text("\u274c Invalid amount.")
+            return
+        amount = round(amount, 2)
+        await queries.set_demo_bankroll(amount)
+        await update.message.reply_text(f"\u2705 Demo bankroll set to <b>${amount:.2f}</b>", parse_mode="HTML")
+        return
+
+    if context.user_data.get("awaiting_ml_threshold"):
+        context.user_data["awaiting_ml_threshold"] = False
+        try:
+            threshold = _parse_ml_threshold(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text(f"\u274c Invalid value. Enter a number up to {MAX_ML_THRESHOLD:.2f}.", parse_mode="HTML")
+            return
+        await queries.set_ml_threshold(threshold)
+        await update.message.reply_text(format_set_threshold(threshold), parse_mode="HTML", reply_markup=ml_menu())
+        return
+
+    if context.user_data.get("awaiting_ml_down_threshold"):
+        context.user_data["awaiting_ml_down_threshold"] = False
+        try:
+            threshold = _parse_ml_threshold(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text(f"\u274c Invalid value. Enter a number up to {MAX_ML_THRESHOLD:.2f}.", parse_mode="HTML")
+            return
+        await queries.set_ml_down_threshold(threshold)
+        await update.message.reply_text(format_set_down_threshold(threshold), parse_mode="HTML", reply_markup=ml_menu())
+        return
+
+    if context.user_data.get("awaiting_threshold_bucket"):
+        mode = context.user_data.pop("awaiting_threshold_bucket")
+        try:
+            bucket = _parse_threshold_bucket(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("\u274c Invalid bucket. Send a number between 0.00 and 1.00.")
+            return
+        await update.message.reply_text(
+            f"Choose the {mode} policy for bucket <b>{bucket}</b>.",
+            parse_mode="HTML",
+            reply_markup=threshold_policy_choice_keyboard(mode, bucket),
+        )
+        return
+
+    if context.user_data.get("awaiting_threshold_clear_bucket"):
+        mode = context.user_data.pop("awaiting_threshold_clear_bucket")
+        try:
+            bucket = _parse_threshold_bucket(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("\u274c Invalid bucket. Send a number between 0.00 and 1.00.")
+            return
+        await queries.clear_threshold_policy(bucket, mode)
+        await update.message.reply_text(
+            f"\u2705 Cleared explicit {mode} policy for bucket <b>{bucket}</b>. It now defaults to FOLLOW.",
+            parse_mode="HTML",
+            reply_markup=threshold_mode_keyboard(mode),
+        )
+        return
+
+    if not context.user_data.get("awaiting_amount"):
+        return
+    context.user_data["awaiting_amount"] = False
+    raw = update.message.text.strip().replace("$", "")
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError("non-positive")
+    except ValueError:
+        await update.message.reply_text("\u274c Invalid amount.")
+        return
+    amount = round(amount, 2)
+    await queries.set_setting("trade_amount_usdc", str(amount))
+    await update.message.reply_text(f"\u2705 Trade amount updated to <b>${amount:.2f}</b>", parse_mode="HTML")
+
 
 def register(application) -> None:
-    """Attach all command and callback handlers to the Telegram Application."""
-    application.add_handler(CommandHandler("start",       cmd_start))
-    application.add_handler(CommandHandler("status",      cmd_status))
-    application.add_handler(CommandHandler("signals",     cmd_signals))
-    application.add_handler(CommandHandler("trades",      cmd_trades))
-    application.add_handler(CommandHandler("settings",    cmd_settings))
-    application.add_handler(CommandHandler("help",        cmd_help))
-    application.add_handler(CommandHandler("redeem",      cmd_redeem))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("signals", cmd_signals))
+    application.add_handler(CommandHandler("trades", cmd_trades))
+    application.add_handler(CommandHandler("settings", cmd_settings))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("redeem", cmd_redeem))
     application.add_handler(CommandHandler("redemptions", cmd_redemptions))
-    application.add_handler(CommandHandler("demo",        cmd_demo))
-    application.add_handler(CommandHandler("patterns",    cmd_patterns))
-    # ML model management commands
-    application.add_handler(CommandHandler("set_threshold",      cmd_set_threshold))
+    application.add_handler(CommandHandler("demo", cmd_demo))
+    application.add_handler(CommandHandler("patterns", cmd_patterns))
+    application.add_handler(CommandHandler("thresholds", cmd_thresholds))
+    application.add_handler(CommandHandler("threshold_stats", cmd_threshold_stats))
+    application.add_handler(CommandHandler("set_threshold", cmd_set_threshold))
     application.add_handler(CommandHandler("set_down_threshold", cmd_set_down_threshold))
-    application.add_handler(CommandHandler("set_blocked_ranges",  cmd_set_blocked_ranges))
+    application.add_handler(CommandHandler("set_blocked_ranges", cmd_set_blocked_ranges))
     application.add_handler(CommandHandler("show_blocked_ranges", cmd_show_blocked_ranges))
-    application.add_handler(CommandHandler("model_status",   cmd_model_status))
-    application.add_handler(CommandHandler("model_compare",  cmd_model_compare))
-    application.add_handler(CommandHandler("promote_model",  cmd_promote_model))
-    application.add_handler(CommandHandler("retrain",        cmd_retrain))
+    application.add_handler(CommandHandler("model_status", cmd_model_status))
+    application.add_handler(CommandHandler("model_compare", cmd_model_compare))
+    application.add_handler(CommandHandler("promote_model", cmd_promote_model))
+    application.add_handler(CommandHandler("retrain", cmd_retrain))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -1095,141 +786,82 @@ def register(application) -> None:
     application.add_error_handler(_error_handler)
 
 
-# ---------------------------------------------------------------------------
-# ML model management commands
-# ---------------------------------------------------------------------------
-
 @auth_check
 async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set ML inference threshold. Usage: /set_threshold 0.56"""
     if not context.args:
-        await update.message.reply_text(
-            f"Usage: /set_threshold &lt;value&gt;\nExample: /set_threshold 0.56\nValid range: any numeric value up to {MAX_ML_THRESHOLD:.2f}",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(f"Usage: /set_threshold <value>\nMax: {MAX_ML_THRESHOLD:.2f}", parse_mode="HTML")
         return
     try:
         threshold = _parse_ml_threshold(context.args[0])
     except (ValueError, IndexError):
-        await update.message.reply_text(
-            f"Invalid value. Example: /set_threshold 0.56. Maximum allowed: {MAX_ML_THRESHOLD:.2f}",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(f"Invalid value. Maximum allowed: {MAX_ML_THRESHOLD:.2f}", parse_mode="HTML")
         return
     await queries.set_ml_threshold(threshold)
-    await update.message.reply_text(
-        format_set_threshold(threshold),
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(format_set_threshold(threshold), parse_mode="HTML")
 
 
 @auth_check
 async def cmd_set_down_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set ML DOWN inference threshold. Usage: /set_down_threshold 0.55"""
     if not context.args:
-        await update.message.reply_text(
-            f"Usage: /set_down_threshold &lt;value&gt;\nExample: /set_down_threshold 0.55\nValid range: any numeric value up to {MAX_ML_THRESHOLD:.2f}",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(f"Usage: /set_down_threshold <value>\nMax: {MAX_ML_THRESHOLD:.2f}", parse_mode="HTML")
         return
     try:
         threshold = _parse_ml_threshold(context.args[0])
     except (ValueError, IndexError):
-        await update.message.reply_text(
-            f"Invalid value. Example: /set_down_threshold 0.55. Maximum allowed: {MAX_ML_THRESHOLD:.2f}", parse_mode="HTML"
-        )
+        await update.message.reply_text(f"Invalid value. Maximum allowed: {MAX_ML_THRESHOLD:.2f}", parse_mode="HTML")
         return
     await queries.set_ml_down_threshold(threshold)
-    await update.message.reply_text(
-        format_set_down_threshold(threshold),
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(format_set_down_threshold(threshold), parse_mode="HTML")
 
 
 @auth_check
 async def cmd_set_blocked_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set blocked threshold ranges. Usage: /set_blocked_ranges 0.20-0.22,0.40-0.42"""
     if not context.args:
         await update.message.reply_text(
-            "Usage: /set_blocked_ranges <ranges>\n"
-            "Example: <code>/set_blocked_ranges 0.20-0.22,0.40-0.42</code>\n"
-            "Or send <code>/set_blocked_ranges none</code> to clear all blocked ranges.",
+            "Usage: /set_blocked_ranges <ranges>\nExample: <code>/set_blocked_ranges 0.20-0.22,0.40-0.42</code>",
             parse_mode="HTML",
         )
         return
     ranges_str = " ".join(context.args).strip()
     parsed = _parse_blocked_ranges(ranges_str)
     if parsed is None:
-        await update.message.reply_text(
-            "Invalid format. Use comma-separated <code>low-high</code> pairs.\n"
-            "Example: <code>/set_blocked_ranges 0.20-0.22,0.40-0.42</code>",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("Invalid format. Use comma-separated <code>low-high</code> pairs.", parse_mode="HTML")
         return
     await queries.set_blocked_threshold_ranges(parsed)
-    if not parsed:
-        text = (
-            "<b>Blocked threshold ranges cleared.</b>\n"
-            "No probability bands are currently blocked."
-        )
-    else:
-        ranges_display = ", ".join(f"[{lo:.2f}, {hi:.2f}]" for lo, hi in parsed)
-        text = (
-            f"<b>Blocked threshold ranges updated.</b>\n"
-            f"Active blocked ranges: {ranges_display}\n"
-            f"Signals with P(UP) or P(DOWN) inside any of these bands will be suppressed."
-        )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=ml_menu())
+    await update.message.reply_text(
+        "Legacy blocked threshold ranges updated. They now act only as fallback for FOLLOW buckets.",
+        parse_mode="HTML",
+        reply_markup=ml_menu(),
+    )
 
 
 @auth_check
 async def cmd_show_blocked_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current blocked threshold ranges."""
     ranges = await queries.get_blocked_threshold_ranges()
     if not ranges:
-        text = (
-            "<b>Blocked Threshold Ranges</b>\n"
-            "None — no probability bands are blocked.\n"
-            "Use <code>/set_blocked_ranges 0.20-0.22</code> to add one."
-        )
+        text = "<b>Blocked Threshold Ranges</b>\nNone configured."
     else:
-        lines = "\n".join(f"  [{lo:.2f}, {hi:.2f}]" for lo, hi in ranges)
-        text = (
-            f"<b>Blocked Threshold Ranges</b>\n"
-            f"Active ranges ({len(ranges)}):\n"
-            f"{lines}\n\n"
-            "Signals with P(UP) or P(DOWN) inside any blocked band are suppressed."
-        )
+        lines = "\n".join(f"[{lo:.2f}, {hi:.2f}]" for lo, hi in ranges)
+        text = f"<b>Blocked Threshold Ranges</b>\n{lines}\n\nUsed only as fallback for FOLLOW buckets."
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=ml_menu())
 
 
 @auth_check
 async def cmd_model_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current ML model status."""
     from ml import model_store
-    if update.callback_query:
-        await update.callback_query.answer()
-        send = update.callback_query.message.reply_text
-    else:
-        send = update.message.reply_text
+    send = update.callback_query.message.reply_text if update.callback_query else update.message.reply_text
     meta = model_store.load_metadata("current")
     if meta is None:
         await send("No model trained yet. Use /retrain to train one.", parse_mode="HTML")
         return
     threshold = await queries.get_ml_threshold()
-    text = format_model_status("current", meta, threshold)
-    await send(text, parse_mode="HTML", reply_markup=back_to_menu())
+    await send(format_model_status("current", meta, threshold), parse_mode="HTML", reply_markup=back_to_menu())
 
 
 @auth_check
 async def cmd_model_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Compare current vs candidate model."""
     from ml import model_store
-    if update.callback_query:
-        await update.callback_query.answer()
-        send = update.callback_query.message.reply_text
-    else:
-        send = update.message.reply_text
+    send = update.callback_query.message.reply_text if update.callback_query else update.message.reply_text
     current_meta = model_store.load_metadata("current")
     candidate_meta = model_store.load_metadata("candidate")
     if current_meta is None:
@@ -1238,67 +870,43 @@ async def cmd_model_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if candidate_meta is None:
         await send("No candidate model. Use /retrain to generate a candidate.", parse_mode="HTML")
         return
-    text = format_model_compare(current_meta, candidate_meta)
-    await send(text, parse_mode="HTML", reply_markup=back_to_menu())
+    await send(format_model_compare(current_meta, candidate_meta), parse_mode="HTML", reply_markup=back_to_menu())
 
 
 @auth_check
 async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Promote candidate model to current (disk + DB)."""
     from ml import model_store
     from core.strategies.ml_strategy import request_model_reload
-    if update.callback_query:
-        await update.callback_query.answer()
-        send = update.callback_query.message.reply_text
-    else:
-        send = update.message.reply_text
+    send = update.callback_query.message.reply_text if update.callback_query else update.message.reply_text
     if not model_store.has_model("candidate"):
-        await send(
-            "No candidate model to promote. Use /retrain first.\n"
-            "<i>(If you already promoted, the candidate was consumed.)</i>",
-            parse_mode="HTML",
-        )
+        await send("No candidate model to promote. Use /retrain first.", parse_mode="HTML")
         return
-    # Promote on disk first, then persist to DB so it survives container restarts
     model_store.promote_candidate()
     try:
         await model_store.promote_candidate_in_db()
     except Exception:
-        log.exception("cmd_promote_model: failed to persist promotion to DB (disk promote succeeded)")
-    # Inject the newly promoted model into the strategy before requesting reload,
-    # so _load_model() picks it up from memory rather than falling back to disk
-    # (disk is ephemeral on Railway and may not have the model after a redeploy).
+        log.exception("cmd_promote_model: failed to persist promotion to DB")
     try:
         promoted = await model_store.load_model_from_db("current")
         if promoted:
             from core.strategies.ml_strategy import set_model
             set_model(promoted)
     except Exception:
-        log.exception("cmd_promote_model: failed to preload promoted model into strategy (non-fatal)")
+        log.exception("cmd_promote_model: failed to preload promoted model into strategy")
     request_model_reload()
     meta = model_store.load_metadata("current")
     threshold = await queries.get_ml_threshold()
-    text = format_model_status("current (promoted)", meta or {}, threshold)
-    await send(
-        f"{text}\n\nCandidate promoted to current. Model will reload on next signal check.",
-        parse_mode="HTML",
-    )
+    await send(f"{format_model_status('current (promoted)', meta or {}, threshold)}\n\nCandidate promoted to current.", parse_mode="HTML")
 
 
 @auth_check
 async def cmd_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Trigger async background retraining."""
-    if update.callback_query:
-        await update.callback_query.answer()
-        send = update.callback_query.message.reply_text
-    else:
-        send = update.message.reply_text
+    send = update.callback_query.message.reply_text if update.callback_query else update.message.reply_text
     await send("Retraining started... estimated time ~5-8 min. I'll notify you when done.", parse_mode="HTML")
     asyncio.create_task(_retrain_background(context.application, cfg.TELEGRAM_CHAT_ID))
 
 
 async def _retrain_background(application, chat_id) -> None:
-    """Background retraining: fetch data, build features, train, save to DB, report."""
     import asyncio as _asyncio
     import html as _html
     from pathlib import Path
@@ -1306,25 +914,14 @@ async def _retrain_background(application, chat_id) -> None:
 
     async def notify(text: str, reply_markup=None) -> None:
         try:
-            await application.bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-            )
+            await application.bot.send_message(chat_id=int(chat_id), text=text, parse_mode="HTML", reply_markup=reply_markup)
         except Exception as e:
             log.warning("_retrain_background: failed to send notification: %s", e)
 
     async def notify_document(path: str, caption: str) -> bool:
         try:
             with open(path, "rb") as fh:
-                await application.bot.send_document(
-                    chat_id=int(chat_id),
-                    document=fh,
-                    filename=Path(path).name,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
+                await application.bot.send_document(chat_id=int(chat_id), document=fh, filename=Path(path).name, caption=caption, parse_mode="HTML")
             return True
         except Exception:
             log.exception("_retrain_background: failed to send retrain report document")
@@ -1332,140 +929,57 @@ async def _retrain_background(application, chat_id) -> None:
 
     try:
         loop = _asyncio.get_event_loop()
-        log.info("Retrain: fetching 9 months of MEXC data...")
-        data = await _asyncio.wait_for(
-            loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=9)),
-            timeout=1500,
-        )
-        log.info("Retrain: building features...")
-        df_feat = await _asyncio.wait_for(
-            loop.run_in_executor(
-                None, lambda: feat_eng.build_features(
-                    data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"]
-                )
-            ),
-            timeout=1500,
-        )
-        log.info("Retrain: training LightGBM (candidate slot)...")
-        result = await _asyncio.wait_for(
-            loop.run_in_executor(None, lambda: trainer.train(df_feat, slot="candidate")),
-            timeout=1500,
-        )
+        data = await _asyncio.wait_for(loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=9)), timeout=1500)
+        df_feat = await _asyncio.wait_for(loop.run_in_executor(None, lambda: feat_eng.build_features(data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"])), timeout=1500)
+        result = await _asyncio.wait_for(loop.run_in_executor(None, lambda: trainer.train(df_feat, slot="candidate")), timeout=1500)
         meta = model_store.load_metadata("candidate") or {}
         threshold = result.get("threshold", 0.535)
-        # down_threshold now comes from the real DOWN sweep in trainer.py,
-        # NOT the arithmetic complement. Falls back to complement only for
-        # models trained before Option B was implemented.
         down_threshold = result.get("down_threshold", round(1.0 - threshold, 4))
-        down_enabled   = result.get("down_enabled", False)
-        down_val_wr    = result.get("down_val_wr", 0.0)
-        down_test_wr   = result.get("down_test_metrics", {}).get("wr", 0.0)
         report_info = result.get("report_info") or {}
         report_error = result.get("report_error")
         report_path = report_info.get("path")
-        report_sent = False
-
-        # Persist up/down thresholds to DB
         try:
             await queries.set_ml_threshold(threshold)
             await queries.set_ml_down_threshold(down_threshold)
         except Exception as thr_exc:
             log.warning("Retrain: failed to persist thresholds to DB: %s", thr_exc)
-
-        # Persist trained candidate model to DB
         try:
             await model_store.save_model_to_db(result["model"], "candidate", meta)
         except Exception as db_exc:
             log.warning("Retrain: failed to save candidate to DB: %s", db_exc)
-
         if result.get("blocked"):
-            # UP side failed the 59% gate — saved to candidate, user decides
-            log.warning(
-                "Retrain: candidate blocked by deployment gate. "
-                "val_wr=%.4f test_wr=%.4f threshold=%.3f | "
-                "down_enabled=%s down_val_wr=%.4f down_test_wr=%.4f down_threshold=%.3f",
-                result.get("val_wr", 0),
-                result.get("test_metrics", {}).get("wr", 0),
-                threshold,
-                down_enabled, down_val_wr, down_test_wr, down_threshold,
-            )
             main_msg, risk_msg = format_retrain_blocked(meta, threshold)
-            if report_path and not report_error:
-                main_msg += "\n\n<b>Detailed Excel trade report:</b> attached below if delivery succeeds."
-            elif report_error:
-                main_msg += "\n\n<i>Detailed Excel trade report could not be generated. Retraining still completed normally.</i>"
             await notify(main_msg, reply_markup=retrain_blocked_keyboard())
             if risk_msg:
                 await notify(risk_msg)
-            if report_path and not report_error:
-                report_sent = await notify_document(
-                    report_path,
-                    "Detailed val/test trade ledger and hourly UTC stats from the completed retrain.",
-                )
-                if not report_sent:
-                    await notify("<i>Retrain finished, but the Excel report could not be sent to Telegram.</i>")
         else:
-            log.info(
-                "Retrain complete. val_wr=%.4f test_wr=%.4f | "
-                "down_enabled=%s down_val_wr=%.4f down_test_wr=%.4f down_threshold=%.3f",
-                result.get("val_wr", 0),
-                result.get("test_metrics", {}).get("wr", 0),
-                down_enabled, down_val_wr, down_test_wr, down_threshold,
-            )
             main_msg, risk_msg = format_retrain_complete(meta, threshold)
-            if report_path and not report_error:
-                main_msg += "\n\n<b>Detailed Excel trade report:</b> attached below if delivery succeeds."
-            elif report_error:
-                main_msg += "\n\n<i>Detailed Excel trade report could not be generated. Retraining still completed normally.</i>"
             await notify(main_msg)
             if risk_msg:
                 await notify(risk_msg)
-            if report_path and not report_error:
-                report_sent = await notify_document(
-                    report_path,
-                    "Detailed val/test trade ledger and hourly UTC stats from the completed retrain.",
-                )
-                if not report_sent:
-                    await notify("<i>Retrain finished, but the Excel report could not be sent to Telegram.</i>")
-            # Auto-promote: UP passed the gate — promote candidate to current now.
             try:
                 from ml import model_store as _ms
-                from core.strategies.ml_strategy import (
-                    request_model_reload as _req_reload,
-                    set_model as _set_model,
-                )
+                from core.strategies.ml_strategy import request_model_reload as _req_reload, set_model as _set_model
                 _ms.promote_candidate()
                 try:
                     await _ms.promote_candidate_in_db()
                 except Exception:
-                    log.exception("_retrain_background: failed to persist auto-promotion to DB (disk promote succeeded)")
+                    log.exception("_retrain_background: failed to persist auto-promotion to DB")
                 try:
                     _promoted = await _ms.load_model_from_db("current")
                     if _promoted:
                         _set_model(_promoted)
                 except Exception:
-                    log.exception("_retrain_background: failed to preload auto-promoted model into strategy (non-fatal)")
+                    log.exception("_retrain_background: failed to preload auto-promoted model")
                 _req_reload()
-                log.info("_retrain_background: candidate auto-promoted to current")
             except Exception:
-                log.exception("_retrain_background: auto-promotion failed (non-fatal)")
-            # If DOWN side did not pass its own gate, ask user whether to override.
-            if not down_enabled:
-                from bot.keyboards import down_override_keyboard as _down_kb
-                await notify(
-                    f"\u2139\ufe0f <b>DOWN signal did not pass the 59\u202f% gate</b>\n\n"
-                    f"Val win-rate: <b>{down_val_wr:.1%}</b>  |  "
-                    f"Test win-rate: <b>{down_test_wr:.1%}</b>  |  "
-                    f"Threshold: <b>{down_threshold}</b>\n\n"
-                    "The UP model has been auto-promoted. "
-                    "Do you want to enable the DOWN signal anyway, or keep it disabled?",
-                    reply_markup=_down_kb(),
-                )
-
+                log.exception("_retrain_background: auto-promotion failed")
+        if report_path and not report_error:
+            sent = await notify_document(report_path, "Detailed val/test trade ledger and hourly UTC stats from the completed retrain.")
+            if not sent:
+                await notify("<i>Retrain finished, but the Excel report could not be sent to Telegram.</i>")
     except _asyncio.TimeoutError:
-        log.error("Retrain background task timed out after 25 min")
         await notify("Retrain timed out after 25 min. Try again or check Railway logs.")
     except Exception as exc:
         log.exception("Retrain background task failed: %s", exc)
-        safe_msg = _html.escape(str(exc))
-        await notify(f"\u274c <b>Retrain failed</b>\n\n{safe_msg}\n\nCheck Railway logs for details.")
+        await notify(f"\u274c <b>Retrain failed</b>\n\n{_html.escape(str(exc))}\n\nCheck Railway logs for details.")

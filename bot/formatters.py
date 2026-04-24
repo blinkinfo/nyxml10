@@ -201,6 +201,7 @@ def format_ml_signal(
     ml_up_threshold: float,
     ml_down_threshold: float,
     ml_down_enabled: bool = False,
+    bucket: str | None = None,
 ) -> str:
     """ML signal notification — Option A card with confidence and edge."""
     side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
@@ -244,6 +245,7 @@ def format_ml_signal(
         f"\u2502  {win_arrow} {win_label}   {win_prob*100:.1f}%  \u2705  edge {edge_str}\n"
         f"\u2502  {los_arrow} {los_label}   {los_prob*100:.1f}%\n"
         f"{thr_line}"
+        f"\u2502  Bucket: {bucket if bucket else 'n/a'}\n"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
     )
 
@@ -313,6 +315,9 @@ def format_trade_resolution(
     slot_start_str: str,
     slot_end_str: str,
     pnl: float,
+    original_side: str | None = None,
+    policy: str = "FOLLOW",
+    bucket: str | None = None,
 ) -> str:
     """Real trade outcome — only sent when a real trade was placed."""
     icon = "\u2705" if is_win else "\u274c"
@@ -326,6 +331,8 @@ def format_trade_resolution(
         f"\u2502 {side_emoji} Side: {side}",
         f"\u2502 \U0001f4b2 Entry: ${entry_price:.2f}",
         f"\u2502 \U0001f4b0 P&L: {sign}${pnl:.2f}",
+        f"\u2502 Policy: {policy}  |  Bucket: {bucket or 'n/a'}",
+        f"\u2502 Model: {original_side or side}  ->  Executed: {side}",
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
     ])
 
@@ -338,6 +345,9 @@ def format_demo_resolution(
     slot_end_str: str,
     pnl: float,
     new_bankroll: float,
+    original_side: str | None = None,
+    policy: str = "FOLLOW",
+    bucket: str | None = None,
 ) -> str:
     """Demo trade outcome — only sent when a demo trade was placed."""
     icon = "\u2705" if is_win else "\u274c"
@@ -352,6 +362,8 @@ def format_demo_resolution(
         f"\u2502 \U0001f4b2 Entry: ${entry_price:.2f}",
         f"\u2502 \U0001f4b0 P&L: {sign}${pnl:.2f}",
         f"\u2502 \U0001f4b5 Bankroll: ${new_bankroll:.2f}",
+        f"\u2502 Policy: {policy}  |  Bucket: {bucket or 'n/a'}",
+        f"\u2502 Model: {original_side or side}  ->  Executed: {side}",
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
     ])
 
@@ -438,6 +450,89 @@ def format_trade_retrying(
         f"\U0001f504 <b>Trade retrying</b> (attempt {attempt}/{max_attempts}) "
         f"{side_emoji} {side} {slot_label} \u2014 {_e(reason)}"
     )
+
+
+def format_threshold_policy_notification(
+    mode: str,
+    slot_start_str: str,
+    slot_end_str: str,
+    model_side: str,
+    policy: str,
+    routed_side: str | None,
+    bucket: str | None,
+    probability: float | None,
+    note: str | None = None,
+) -> str:
+    routed_text = routed_side or 'BLOCKED'
+    prob_text = f"{probability*100:.1f}%" if probability is not None else 'n/a'
+    note_line = f"\nNote: {_e(note)}" if note else ''
+    return (
+        f"\U0001f6a6 <b>Threshold Policy - {mode.upper()}</b>\n"
+        f"Slot: {slot_start_str}-{slot_end_str} UTC\n"
+        f"Bucket: {bucket or 'n/a'}  |  Prob: {prob_text}\n"
+        f"Model: {model_side}  |  Policy: {policy}  |  Result: {routed_text}"
+        f"{note_line}"
+    )
+
+
+def format_demo_trade_placed(
+    side: str,
+    original_side: str,
+    policy: str,
+    bucket: str | None,
+    entry_price: float,
+    amount_usdc: float,
+    new_bankroll: float,
+) -> str:
+    return (
+        f"\U0001f9ea <b>[DEMO] Trade Placed</b>\n"
+        f"Model: {original_side}  |  Executed: {side}\n"
+        f"Policy: {policy}  |  Bucket: {bucket or 'n/a'}\n"
+        f"Entry: ${entry_price:.2f}  |  Size: ${amount_usdc:.2f}\n"
+        f"Bankroll: ${new_bankroll:.2f}"
+    )
+
+
+def format_demo_trade_skipped(
+    slot_start_str: str,
+    slot_end_str: str,
+    reason: str,
+    bucket: str | None = None,
+) -> str:
+    return (
+        f"\U0001f9ea <b>[DEMO] Trade Skipped</b>\n"
+        f"Slot: {slot_start_str}-{slot_end_str} UTC\n"
+        f"Bucket: {bucket or 'n/a'}\n"
+        f"Reason: {_e(reason)}"
+    )
+
+
+def format_threshold_policy_dashboard(mode: str, rows: list[dict[str, Any]], label: str = 'Configured Buckets') -> str:
+    lines = [f"<b>Threshold Policies - {mode.upper()}</b>", SEP, label]
+    if not rows:
+        lines.append('No explicit bucket policies. Unspecified buckets default to FOLLOW.')
+        return '\n'.join(lines)
+    for row in rows[:25]:
+        lines.append(f"{row['probability_bucket']}: {row['policy']}")
+    return '\n'.join(lines)
+
+
+def format_threshold_analytics(mode: str, rows: list[dict[str, Any]], label: str = 'All Time') -> str:
+    lines = [f"<b>Threshold Analytics - {mode.upper()} ({label})</b>", SEP]
+    if not rows:
+        lines.append('No threshold-routed signals recorded yet.')
+        return '\n'.join(lines)
+    for row in rows[:20]:
+        total_signals = int(row.get('total_signals', row.get('total_trades', 0)) or 0)
+        executed_signals = int(row.get('executed_signals', row.get('total_trades', 0)) or 0)
+        blocked_signals = int(row.get('blocked_signals', max(total_signals - executed_signals, 0)) or 0)
+        sign = '+' if row['net_pnl'] >= 0 else ''
+        roi_sign = '+' if row['roi_pct'] >= 0 else ''
+        lines.append(
+            f"Bucket {row['bucket']}  |  {row['policy']}  |  Signals T/E/B {total_signals}/{executed_signals}/{blocked_signals}  |  "
+            f"{row['wins']}W/{row['losses']}L  |  WR {row['win_pct']}%  |  PnL {sign}${row['net_pnl']:.2f}  |  ROI {roi_sign}{row['roi_pct']}%"
+        )
+    return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +829,14 @@ def format_help() -> str:
         "<b>Actions</b>\n"
         "/redeem  &middot; /redemptions\n\n"
         "<b>Config</b>\n"
-        "/settings  &middot; /demo\n\n"
+        "/settings  &middot; /demo  &middot; /thresholds\n\n"
         "<b>Misc</b>\n"
         "/help  &middot; /start\n\n"
         "<b>ML Thresholds</b>\n"
         "/set_threshold &lt;val&gt;  — manually override the UP (LONG) inference threshold\n"
         "/set_down_threshold &lt;val&gt;  — manually override the DOWN (SHORT) inference threshold\n"
+        "/thresholds  — configure per-bucket FOLLOW/BLOCK/INVERT routing\n"
+        "/threshold_stats  — view threshold analytics for real/demo trades\n"
         + SEP + "\n"
         "<b>How it works:</b>\n"
         "Every 5 minutes the bot analyses the last six closed BTC-USD "
