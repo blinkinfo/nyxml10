@@ -571,7 +571,13 @@ _POLICY_EMOJI = {
 }
 
 
-def format_threshold_policy_dashboard(mode: str, rows: list[dict[str, Any]], label: str = 'Configured Buckets') -> str:
+def format_threshold_policy_dashboard(
+    mode: str,
+    rows: list[dict[str, Any]],
+    label: str = 'Configured Buckets',
+    page: int = 1,
+    total_pages: int = 1,
+) -> str:
     mode_emoji = '\U0001f4ca' if mode == 'real' else '\U0001f9ea'
     header = f"{mode_emoji} <b>{mode.capitalize()} \u2014 Bucket Policies</b>"
     top = f"\u250c{'─'*25}"
@@ -587,14 +593,15 @@ def format_threshold_policy_dashboard(mode: str, rows: list[dict[str, Any]], lab
             f"{bot}"
         )
 
-    count = len(rows[:25])
+    count = len(rows)
+    page_info = f"  \u00b7  page {page}/{total_pages}" if total_pages > 1 else ""
     lines = [
         header,
         top,
-        f"\u2502  {count} bucket{'s' if count != 1 else ''} configured",
+        f"\u2502  {count} bucket{'s' if count != 1 else ''} configured{page_info}",
         mid,
     ]
-    for row in rows[:25]:
+    for row in rows:
         p = row['policy']
         emoji = _POLICY_EMOJI.get(p, '\u2022')
         lines.append(f"\u2502  {emoji} <b>{row['probability_bucket']}</b>  \u2192  {p}")
@@ -604,9 +611,16 @@ def format_threshold_policy_dashboard(mode: str, rows: list[dict[str, Any]], lab
     return '\n'.join(lines)
 
 
-def format_threshold_analytics(mode: str, rows: list[dict[str, Any]], label: str = 'All Time') -> str:
+def format_threshold_analytics(
+    mode: str,
+    rows: list[dict[str, Any]],
+    label: str = 'All Time',
+    page: int = 1,
+    total_pages: int = 1,
+) -> str:
     mode_emoji = '\U0001f4c8' if mode == 'real' else '\U0001f9ea'
-    header = f"{mode_emoji} <b>Threshold Analytics \u2014 {mode.upper()}</b>  \u00b7  {label}"
+    page_info = f"  \u00b7  page {page}/{total_pages}" if total_pages > 1 else ""
+    header = f"{mode_emoji} <b>Threshold Analytics \u2014 {mode.upper()}</b>  \u00b7  {label}{page_info}"
     top = f"\u250c{'─'*25}"
     mid = f"\u251c{'─'*25}"
     bot = f"\u2514{'─'*25}"
@@ -620,7 +634,7 @@ def format_threshold_analytics(mode: str, rows: list[dict[str, Any]], label: str
         )
 
     blocks: list[str] = [header]
-    for row in rows[:20]:
+    for row in rows:
         total_signals    = int(row.get('total_signals',    row.get('total_trades', 0)) or 0)
         executed_signals = int(row.get('executed_signals', row.get('total_trades', 0)) or 0)
         blocked_signals  = int(row.get('blocked_signals',  max(total_signals - executed_signals, 0)) or 0)

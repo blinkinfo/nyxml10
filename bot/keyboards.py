@@ -299,14 +299,45 @@ def threshold_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def threshold_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def threshold_mode_keyboard(
+    mode: str,
+    page: int = 1,
+    total_pages: int = 1,
+) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton('\u270f\ufe0f Set Policy', callback_data=f'threshold_set_{mode}'),
             InlineKeyboardButton('\U0001f5d1 Clear Policy', callback_data=f'threshold_clear_{mode}'),
         ],
-        [InlineKeyboardButton('\u2190 Back to Hub', callback_data='cmd_thresholds')],
-    ])
+    ]
+    if total_pages > 1:
+        prev_page = page - 1 if page > 1 else total_pages
+        next_page = page + 1 if page < total_pages else 1
+        rows.append([
+            InlineKeyboardButton('\u25c0 Prev', callback_data=f'thresholds_{mode}_p{prev_page}'),
+            InlineKeyboardButton(f'{page}/{total_pages}', callback_data='noop'),
+            InlineKeyboardButton('Next \u25b6', callback_data=f'thresholds_{mode}_p{next_page}'),
+        ])
+    rows.append([InlineKeyboardButton('\u2190 Back to Hub', callback_data='cmd_thresholds')])
+    return InlineKeyboardMarkup(rows)
+
+
+def threshold_analytics_keyboard(
+    mode: str,
+    page: int = 1,
+    total_pages: int = 1,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if total_pages > 1:
+        prev_page = page - 1 if page > 1 else total_pages
+        next_page = page + 1 if page < total_pages else 1
+        rows.append([
+            InlineKeyboardButton('\u25c0 Prev', callback_data=f'threshold_stats_{mode}_p{prev_page}'),
+            InlineKeyboardButton(f'{page}/{total_pages}', callback_data='noop'),
+            InlineKeyboardButton('Next \u25b6', callback_data=f'threshold_stats_{mode}_p{next_page}'),
+        ])
+    rows.append([InlineKeyboardButton('\u2190 Back to Hub', callback_data='cmd_thresholds')])
+    return InlineKeyboardMarkup(rows)
 
 
 def threshold_policy_choice_keyboard(mode: str, bucket: str) -> InlineKeyboardMarkup:

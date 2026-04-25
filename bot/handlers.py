@@ -56,6 +56,7 @@ from bot.keyboards import (
     retrain_blocked_keyboard,
     settings_keyboard,
     signal_filter_row,
+    threshold_analytics_keyboard,
     threshold_cancel_keyboard,
     threshold_menu,
     threshold_mode_keyboard,
@@ -491,10 +492,35 @@ async def cmd_thresholds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(text, reply_markup=threshold_menu(), parse_mode="HTML")
 
 
-async def _render_threshold_policies(update: Update, mode: str) -> None:
-    rows = await queries.list_threshold_policies(mode=mode)
-    text = format_threshold_policy_dashboard(mode, rows)
-    kb = threshold_mode_keyboard(mode)
+_POLICIES_PAGE_SIZE = 10
+_ANALYTICS_PAGE_SIZE = 5
+
+
+async def _render_threshold_policies(update: Update, mode: str, page: int = 1) -> None:
+    all_rows = await queries.list_threshold_policies(mode=mode)
+    total = len(all_rows)
+    total_pages = max(1, (total + _POLICIES_PAGE_SIZE - 1) // _POLICIES_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * _POLICIES_PAGE_SIZE
+    page_rows = all_rows[start:start + _POLICIES_PAGE_SIZE]
+    text = format_threshold_policy_dashboard(mode, page_rows, page=page, total_pages=total_pages)
+    kb = threshold_mode_keyboard(mode, page=page, total_pages=total_pages)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def _render_threshold_analytics(update: Update, mode: str, page: int = 1) -> None:
+    all_rows = await queries.get_threshold_stats(mode)
+    total = len(all_rows)
+    total_pages = max(1, (total + _ANALYTICS_PAGE_SIZE - 1) // _ANALYTICS_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * _ANALYTICS_PAGE_SIZE
+    page_rows = all_rows[start:start + _ANALYTICS_PAGE_SIZE]
+    text = format_threshold_analytics(mode, page_rows, page=page, total_pages=total_pages)
+    kb = threshold_analytics_keyboard(mode, page=page, total_pages=total_pages)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=kb)
@@ -507,13 +533,7 @@ async def cmd_threshold_stats(update: Update, context: ContextTypes.DEFAULT_TYPE
     mode = "real"
     if context.args and context.args[0].lower() in {"real", "demo"}:
         mode = context.args[0].lower()
-    rows = await queries.get_threshold_stats(mode)
-    text = format_threshold_analytics(mode, rows)
-    if update.callback_query:
-        await update.callback_query.answer()
-        await _safe_edit(update.callback_query, text, reply_markup=threshold_menu())
-    else:
-        await update.message.reply_text(text, reply_markup=threshold_menu(), parse_mode="HTML")
+    await _render_threshold_analytics(update, mode, page=1)
 
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -636,16 +656,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_edit(query, "\U0001f916 <b>ML Model</b>", reply_markup=ml_menu())
     elif data == "cmd_thresholds":
         await cmd_thresholds(update, context)
-    elif data == "thresholds_real":
-        await _render_threshold_policies(update, "real")
-    elif data == "thresholds_demo":
-        await _render_threshold_policies(update, "demo")
-    elif data == "threshold_stats_real":
-        rows = await queries.get_threshold_stats("real")
-        await _safe_edit(query, format_threshold_analytics("real", rows), reply_markup=threshold_menu())
-    elif data == "threshold_stats_demo":
-        rows = await queries.get_threshold_stats("demo")
-        await _safe_edit(query, format_threshold_analytics("demo", rows), reply_markup=threshold_menu())
+    elif data == "thresholds_real" or (data.startswith("thresholds_real_p") and data[len("thresholds_real_p"):].isdigit()):
+        page = int(data[len("thresholds_real_p"):]) if "_p" in data else 1
+        await _render_threshold_policies(update, "real", page=page)
+    elif data == "thresholds_demo" or (data.startswith("thresholds_demo_p") and data[len("thresholds_demo_p"):].isdigit()):
+        page = int(data[len("thresholds_demo_p"):]) if "_p" in data else 1
+        await _render_threshold_policies(update, "demo", page=page)
+    elif data == "threshold_stats_real" or (data.startswith("threshold_stats_real_p") and data[len("threshold_stats_real_p"):].isdigit()):
+        page = int(data[len("threshold_stats_real_p"):]) if "_p" in data else 1
+        await _render_threshold_analytics(update, "real", page=page)
+    elif data == "threshold_stats_demo" or (data.startswith("threshold_stats_demo_p") and data[len("threshold_stats_demo_p"):].isdigit()):
+        page = int(data[len("threshold_stats_demo_p"):]) if "_p" in data else 1
+        await _render_threshold_analytics(update, "demo", page=page)
+    elif data == "noop":
+        await query.answer()
     elif data.startswith("threshold_set_"):
         mode = data.split("_")[-1]
         context.user_data["awaiting_threshold_bucket"] = mode
