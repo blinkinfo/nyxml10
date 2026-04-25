@@ -465,13 +465,31 @@ def format_threshold_policy_notification(
 ) -> str:
     routed_text = routed_side or 'BLOCKED'
     prob_text = f"{probability*100:.1f}%" if probability is not None else 'n/a'
-    note_line = f"\nNote: {_e(note)}" if note else ''
+    note_line = f"\n\u2502  \U0001f4dd Note: {_e(note)}" if note else ''
+
+    # Result emoji by outcome
+    if routed_text == 'BLOCKED':
+        result_emoji = '\U0001f534'
+    elif policy == 'INVERT':
+        result_emoji = '\U0001f501'
+    else:
+        result_emoji = '\U0001f7e2'
+
+    # Model side emoji
+    model_emoji = '\U0001f4c8' if model_side.upper() == 'UP' else '\U0001f4c9'
+
     return (
-        f"\U0001f6a6 <b>Threshold Policy - {mode.upper()}</b>\n"
-        f"Slot: {slot_start_str}-{slot_end_str} UTC\n"
-        f"Bucket: {bucket or 'n/a'}  |  Prob: {prob_text}\n"
-        f"Model: {model_side}  |  Policy: {policy}  |  Result: {routed_text}"
-        f"{note_line}"
+        f"\U0001f6a6 <b>Threshold Policy \u2014 {mode.upper()}</b>\n"
+        f"\u250c{'─'*29}\n"
+        f"\u2502  \u23f0 Slot:    {slot_start_str} \u2013 {slot_end_str} UTC\n"
+        f"\u2502  {model_emoji} Model:   {model_side}\n"
+        f"\u2502  \U0001faa3 Bucket:  {bucket or 'n/a'}\n"
+        f"\u2502  \U0001f4ca Prob:    {prob_text}\n"
+        f"\u251c{'─'*29}\n"
+        f"\u2502  \U0001f4cc Policy:  {policy}\n"
+        f"\u2502  {result_emoji} Result:  {routed_text}"
+        f"{note_line}\n"
+        f"\u2514{'─'*29}"
     )
 
 
@@ -507,32 +525,96 @@ def format_demo_trade_skipped(
     )
 
 
+_POLICY_EMOJI = {
+    'FOLLOW': '\U0001f7e2',
+    'BLOCK':  '\U0001f534',
+    'INVERT': '\U0001f501',
+}
+
+
 def format_threshold_policy_dashboard(mode: str, rows: list[dict[str, Any]], label: str = 'Configured Buckets') -> str:
-    lines = [f"<b>Threshold Policies - {mode.upper()}</b>", SEP, label]
+    mode_emoji = '\U0001f4ca' if mode == 'real' else '\U0001f9ea'
+    header = f"{mode_emoji} <b>{mode.capitalize()} \u2014 Bucket Policies</b>"
+    top = f"\u250c{'─'*29}"
+    mid = f"\u251c{'─'*29}"
+    bot = f"\u2514{'─'*29}"
+
     if not rows:
-        lines.append('No explicit bucket policies. Unspecified buckets default to FOLLOW.')
-        return '\n'.join(lines)
+        return (
+            f"{header}\n"
+            f"{top}\n"
+            f"\u2502  No explicit policies configured.\n"
+            f"\u2502  All buckets default to \U0001f7e2 FOLLOW.\n"
+            f"{bot}"
+        )
+
+    count = len(rows[:25])
+    lines = [
+        header,
+        top,
+        f"\u2502  {count} bucket{'s' if count != 1 else ''} configured",
+        mid,
+    ]
     for row in rows[:25]:
-        lines.append(f"{row['probability_bucket']}: {row['policy']}")
+        p = row['policy']
+        emoji = _POLICY_EMOJI.get(p, '\u2022')
+        lines.append(f"\u2502  {emoji} <b>{row['probability_bucket']}</b>  \u2192  {p}")
+    lines.append(mid)
+    lines.append("\u2502  Unset buckets default to \U0001f7e2 FOLLOW")
+    lines.append(bot)
     return '\n'.join(lines)
 
 
 def format_threshold_analytics(mode: str, rows: list[dict[str, Any]], label: str = 'All Time') -> str:
-    lines = [f"<b>Threshold Analytics - {mode.upper()} ({label})</b>", SEP]
+    mode_emoji = '\U0001f4c8' if mode == 'real' else '\U0001f9ea'
+    header = f"{mode_emoji} <b>Threshold Analytics \u2014 {mode.upper()}</b>  \u00b7  {label}"
+    top = f"\u250c{'─'*29}"
+    mid = f"\u251c{'─'*29}"
+    bot = f"\u2514{'─'*29}"
+
     if not rows:
-        lines.append('No threshold-routed signals recorded yet.')
-        return '\n'.join(lines)
-    for row in rows[:20]:
-        total_signals = int(row.get('total_signals', row.get('total_trades', 0)) or 0)
-        executed_signals = int(row.get('executed_signals', row.get('total_trades', 0)) or 0)
-        blocked_signals = int(row.get('blocked_signals', max(total_signals - executed_signals, 0)) or 0)
-        sign = '+' if row['net_pnl'] >= 0 else ''
-        roi_sign = '+' if row['roi_pct'] >= 0 else ''
-        lines.append(
-            f"Bucket {row['bucket']}  |  {row['policy']}  |  Signals T/E/B {total_signals}/{executed_signals}/{blocked_signals}  |  "
-            f"{row['wins']}W/{row['losses']}L  |  WR {row['win_pct']}%  |  PnL {sign}${row['net_pnl']:.2f}  |  ROI {roi_sign}{row['roi_pct']}%"
+        return (
+            f"{header}\n"
+            f"{top}\n"
+            f"\u2502  No threshold-routed signals recorded yet.\n"
+            f"{bot}"
         )
-    return '\n'.join(lines)
+
+    blocks: list[str] = [header]
+    for row in rows[:20]:
+        total_signals    = int(row.get('total_signals',    row.get('total_trades', 0)) or 0)
+        executed_signals = int(row.get('executed_signals', row.get('total_trades', 0)) or 0)
+        blocked_signals  = int(row.get('blocked_signals',  max(total_signals - executed_signals, 0)) or 0)
+        wins   = int(row.get('wins',   0))
+        losses = int(row.get('losses', 0))
+        wr     = float(row.get('win_pct', 0))
+        pnl    = float(row.get('net_pnl',  0))
+        roi    = float(row.get('roi_pct',  0))
+        policy = row.get('policy', 'n/a')
+        bucket = row.get('bucket', 'n/a')
+
+        pnl_sign = '+' if pnl >= 0 else ''
+        roi_sign = '+' if roi >= 0 else ''
+
+        # Win-rate colour
+        if wr >= 55.0:
+            wr_emoji = '\U0001f7e2'
+        elif wr >= 45.0:
+            wr_emoji = '\U0001f7e1'
+        else:
+            wr_emoji = '\U0001f534'
+
+        p_emoji = _POLICY_EMOJI.get(policy, '\u2022')
+
+        blocks.append(top)
+        blocks.append(f"\u2502  \U0001faa3 Bucket <b>{bucket}</b>  \u00b7  {p_emoji} {policy}")
+        blocks.append(mid)
+        blocks.append(f"\u2502  Signals:  {total_signals} total  \u00b7  {executed_signals} exec  \u00b7  {blocked_signals} blocked")
+        blocks.append(f"\u2502  Result:   {wins}W / {losses}L  \u00b7  {wr_emoji} WR {wr}%")
+        blocks.append(f"\u2502  PnL:      {pnl_sign}${pnl:.2f}  \u00b7  ROI {roi_sign}{roi}%")
+        blocks.append(bot)
+
+    return '\n'.join(blocks)
 
 
 # ---------------------------------------------------------------------------

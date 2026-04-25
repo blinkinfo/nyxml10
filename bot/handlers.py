@@ -56,6 +56,7 @@ from bot.keyboards import (
     retrain_blocked_keyboard,
     settings_keyboard,
     signal_filter_row,
+    threshold_cancel_keyboard,
     threshold_menu,
     threshold_mode_keyboard,
     threshold_policy_choice_keyboard,
@@ -475,7 +476,14 @@ async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @auth_check
 async def cmd_thresholds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "<b>Threshold Routing</b>\nPer-bucket policies are stored separately for real and demo. Unspecified buckets default to FOLLOW."
+    text = (
+        "\U0001f500 <b>Threshold Routing</b>\n"
+        "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "\u2502  \U0001f500 Per-bucket signal routing\n"
+        "\u2502  Real and demo configured separately\n"
+        "\u2502  Unset buckets \u2192 \U0001f7e2 FOLLOW by default\n"
+        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    )
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=threshold_menu())
@@ -641,16 +649,47 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("threshold_set_"):
         mode = data.split("_")[-1]
         context.user_data["awaiting_threshold_bucket"] = mode
-        await _safe_edit(query, f"Send the {mode} bucket to edit, for example <code>0.53</code>.", reply_markup=threshold_mode_keyboard(mode))
+        mode_emoji = "\U0001f4ca" if mode == "real" else "\U0001f9ea"
+        prompt = (
+            f"\u270f\ufe0f <b>Set Bucket Policy \u2014 {mode.upper()}</b>\n"
+            "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"\u2502  {mode_emoji} Enter the bucket value to configure\n"
+            "\u2502\n"
+            "\u2502  Example:  <code>0.53</code>  or  <code>0.57</code>\n"
+            "\u2502  Range:    0.00 \u2013 1.00\n"
+            "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "Reply with the bucket number now."
+        )
+        await _safe_edit(query, prompt, reply_markup=threshold_cancel_keyboard(mode))
     elif data.startswith("threshold_clear_"):
         mode = data.split("_")[-1]
         context.user_data["awaiting_threshold_clear_bucket"] = mode
-        await _safe_edit(query, f"Send the {mode} bucket to clear, for example <code>0.53</code>.", reply_markup=threshold_mode_keyboard(mode))
+        mode_emoji = "\U0001f4ca" if mode == "real" else "\U0001f9ea"
+        prompt = (
+            f"\U0001f5d1 <b>Clear Bucket Policy \u2014 {mode.upper()}</b>\n"
+            "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"\u2502  {mode_emoji} Enter the bucket value to clear\n"
+            "\u2502\n"
+            "\u2502  Example:  <code>0.53</code>  or  <code>0.57</code>\n"
+            "\u2502  Range:    0.00 \u2013 1.00\n"
+            "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "Reply with the bucket number now."
+        )
+        await _safe_edit(query, prompt, reply_markup=threshold_cancel_keyboard(mode))
     elif data.startswith("threshold_policy_"):
         _, _, mode, bucket, policy = data.split("_", 4)
         await queries.set_threshold_policy(bucket, mode, policy)
-        await query.answer(f"{mode} bucket {bucket} -> {policy}")
-        await _render_threshold_policies(update, mode)
+        _policy_emoji = {"FOLLOW": "\U0001f7e2", "BLOCK": "\U0001f534", "INVERT": "\U0001f501"}
+        p_emoji = _policy_emoji.get(policy, "\u2022")
+        confirm = (
+            f"\u2705 <b>Policy Set \u2014 {mode.upper()}</b>\n"
+            "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"\u2502  \U0001faa3 Bucket:  <b>{bucket}</b>\n"
+            f"\u2502  \U0001f4cc Policy:  {p_emoji} {policy}\n"
+            "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        )
+        await query.answer(f"{mode} bucket {bucket} \u2192 {policy}")
+        await _safe_edit(query, confirm, reply_markup=threshold_mode_keyboard(mode))
     elif data == "ml_status":
         await query.answer(); await cmd_model_status(update, context)
     elif data == "ml_compare":
@@ -761,10 +800,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             bucket = _parse_threshold_bucket(update.message.text.strip())
         except ValueError:
-            await update.message.reply_text("\u274c Invalid bucket. Send a number between 0.00 and 1.00.")
+            await update.message.reply_text(
+                "\u274c <b>Invalid bucket.</b> Send a number between <code>0.00</code> and <code>1.00</code>.",
+                parse_mode="HTML",
+                reply_markup=threshold_cancel_keyboard(mode),
+            )
+            context.user_data["awaiting_threshold_bucket"] = mode
             return
+        mode_emoji = "\U0001f4ca" if mode == "real" else "\U0001f9ea"
+        policy_card = (
+            f"\U0001f3af <b>Set Policy \u2014 {mode.upper()}</b>  \u2502  Bucket <b>{bucket}</b>\n"
+            "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "\u2502  Choose how signals in this bucket\n"
+            "\u2502  should be routed:\n"
+            "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "\u2502  \U0001f7e2 FOLLOW  \u2014 trade as model says\n"
+            "\u2502  \U0001f534 BLOCK   \u2014 skip this signal\n"
+            "\u2502  \U0001f501 INVERT  \u2014 flip direction\n"
+            "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        )
         await update.message.reply_text(
-            f"Choose the {mode} policy for bucket <b>{bucket}</b>.",
+            policy_card,
             parse_mode="HTML",
             reply_markup=threshold_policy_choice_keyboard(mode, bucket),
         )
@@ -775,11 +831,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             bucket = _parse_threshold_bucket(update.message.text.strip())
         except ValueError:
-            await update.message.reply_text("\u274c Invalid bucket. Send a number between 0.00 and 1.00.")
+            await update.message.reply_text(
+                "\u274c <b>Invalid bucket.</b> Send a number between <code>0.00</code> and <code>1.00</code>.",
+                parse_mode="HTML",
+                reply_markup=threshold_cancel_keyboard(mode),
+            )
+            context.user_data["awaiting_threshold_clear_bucket"] = mode
             return
         await queries.clear_threshold_policy(bucket, mode)
+        clear_confirm = (
+            f"\U0001f5d1 <b>Policy Cleared \u2014 {mode.upper()}</b>\n"
+            "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"\u2502  \U0001faa3 Bucket:  <b>{bucket}</b>\n"
+            f"\u2502  \u21a9\ufe0f Now defaults to \U0001f7e2 FOLLOW\n"
+            "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        )
         await update.message.reply_text(
-            f"\u2705 Cleared explicit {mode} policy for bucket <b>{bucket}</b>. It now defaults to FOLLOW.",
+            clear_confirm,
             parse_mode="HTML",
             reply_markup=threshold_mode_keyboard(mode),
         )

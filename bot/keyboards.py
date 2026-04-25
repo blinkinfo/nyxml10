@@ -39,7 +39,7 @@ def main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("\U0001f916 ML Model", callback_data="cmd_ml"),
-            InlineKeyboardButton("Thresholds", callback_data="cmd_thresholds"),
+            InlineKeyboardButton("\U0001f500 Thresholds", callback_data="cmd_thresholds"),
         ],
         [
             InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
@@ -288,33 +288,40 @@ def ml_volatility_gate_confirm_keyboard() -> InlineKeyboardMarkup:
 def threshold_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton('Real Policies', callback_data='thresholds_real'),
-            InlineKeyboardButton('Demo Policies', callback_data='thresholds_demo'),
+            InlineKeyboardButton('\U0001f4ca Real Policies', callback_data='thresholds_real'),
+            InlineKeyboardButton('\U0001f9ea Demo Policies', callback_data='thresholds_demo'),
         ],
         [
-            InlineKeyboardButton('Real Analytics', callback_data='threshold_stats_real'),
-            InlineKeyboardButton('Demo Analytics', callback_data='threshold_stats_demo'),
+            InlineKeyboardButton('\U0001f4c8 Real Analytics', callback_data='threshold_stats_real'),
+            InlineKeyboardButton('\U0001f4c9 Demo Analytics', callback_data='threshold_stats_demo'),
         ],
-        [InlineKeyboardButton('Back to Menu', callback_data='cmd_menu')],
+        [InlineKeyboardButton('\U0001f3e0 Back to Menu', callback_data='cmd_menu')],
     ])
 
 
 def threshold_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton('Set Bucket Policy', callback_data=f'threshold_set_{mode}'),
-            InlineKeyboardButton('Clear Bucket Policy', callback_data=f'threshold_clear_{mode}'),
+            InlineKeyboardButton('\u270f\ufe0f Set Policy', callback_data=f'threshold_set_{mode}'),
+            InlineKeyboardButton('\U0001f5d1 Clear Policy', callback_data=f'threshold_clear_{mode}'),
         ],
-        [InlineKeyboardButton('Back', callback_data='cmd_thresholds')],
+        [InlineKeyboardButton('\u2190 Back to Hub', callback_data='cmd_thresholds')],
     ])
 
 
 def threshold_policy_choice_keyboard(mode: str, bucket: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton('FOLLOW', callback_data=f'threshold_policy_{mode}_{bucket}_FOLLOW'),
-            InlineKeyboardButton('BLOCK', callback_data=f'threshold_policy_{mode}_{bucket}_BLOCK'),
-            InlineKeyboardButton('INVERT', callback_data=f'threshold_policy_{mode}_{bucket}_INVERT'),
+            InlineKeyboardButton('\U0001f7e2 FOLLOW', callback_data=f'threshold_policy_{mode}_{bucket}_FOLLOW'),
+            InlineKeyboardButton('\U0001f534 BLOCK',  callback_data=f'threshold_policy_{mode}_{bucket}_BLOCK'),
+            InlineKeyboardButton('\U0001f501 INVERT', callback_data=f'threshold_policy_{mode}_{bucket}_INVERT'),
         ],
-        [InlineKeyboardButton('Back', callback_data=f'thresholds_{mode}')],
+        [InlineKeyboardButton('\u2190 Back', callback_data=f'thresholds_{mode}')],
+    ])
+
+
+def threshold_cancel_keyboard(mode: str) -> InlineKeyboardMarkup:
+    """Shown during bucket-input prompts so the user can abort."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('\u274c Cancel', callback_data=f'thresholds_{mode}')],
     ])
