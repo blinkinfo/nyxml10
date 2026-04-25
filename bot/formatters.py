@@ -501,13 +501,37 @@ def format_demo_trade_placed(
     entry_price: float,
     amount_usdc: float,
     new_bankroll: float,
+    slot_start_str: str = '',
+    slot_end_str: str = '',
 ) -> str:
+    # Model → executed line: show arrow + INVERT label when sides differ
+    if policy == 'INVERT':
+        model_emoji = '\U0001f4c8' if original_side.upper() == 'UP' else '\U0001f4c9'
+        exec_emoji  = '\U0001f4c9' if original_side.upper() == 'UP' else '\U0001f4c8'
+        model_line  = f'{model_emoji} {original_side} \u2192 \U0001f501 {exec_emoji} {side} (INVERT)'
+    else:
+        model_emoji = '\U0001f4c8' if side.upper() == 'UP' else '\U0001f4c9'
+        model_line  = f'{model_emoji} Model:    {side}'
+
+    slot_line = (
+        f'\u2502  \u23f0 Slot:     {slot_start_str} \u2013 {slot_end_str} UTC\n'
+        if slot_start_str else ''
+    )
+
+    _top = '\u250c' + '\u2500' * 29
+    _mid = '\u251c' + '\u2500' * 29
+    _bot = '\u2514' + '\u2500' * 29
     return (
-        f"\U0001f9ea <b>[DEMO] Trade Placed</b>\n"
-        f"Model: {original_side}  |  Executed: {side}\n"
-        f"Policy: {policy}  |  Bucket: {bucket or 'n/a'}\n"
-        f"Entry: ${entry_price:.2f}  |  Size: ${amount_usdc:.2f}\n"
-        f"Bankroll: ${new_bankroll:.2f}"
+        f'\U0001f9ea <b>[DEMO] Trade Placed</b>\n'
+        f'{_top}\n'
+        f'{slot_line}'
+        f'\u2502  {model_line}\n'
+        f'\u2502  \U0001faa3 Bucket:   {bucket or "n/a"}\n'
+        f'{_mid}\n'
+        f'\u2502  \U0001f4b5 Entry:    ${entry_price:.2f}\n'
+        f'\u2502  \U0001f4e6 Size:     ${amount_usdc:.2f}\n'
+        f'\u2502  \U0001f3e6 Bankroll: ${new_bankroll:,.2f}\n'
+        f'{_bot}'
     )
 
 
@@ -516,12 +540,27 @@ def format_demo_trade_skipped(
     slot_end_str: str,
     reason: str,
     bucket: str | None = None,
+    policy: str | None = None,
 ) -> str:
+    # Derive reason emoji from policy if available, else generic
+    if policy == 'BLOCK':
+        reason_emoji = '\U0001f534'
+    elif policy == 'INVERT':
+        reason_emoji = '\U0001f501'
+    else:
+        reason_emoji = '\u26a0\ufe0f'
+
+    _top = '\u250c' + '\u2500' * 29
+    _mid = '\u251c' + '\u2500' * 29
+    _bot = '\u2514' + '\u2500' * 29
     return (
-        f"\U0001f9ea <b>[DEMO] Trade Skipped</b>\n"
-        f"Slot: {slot_start_str}-{slot_end_str} UTC\n"
-        f"Bucket: {bucket or 'n/a'}\n"
-        f"Reason: {_e(reason)}"
+        f'\U0001f9ea <b>[DEMO] Trade Skipped</b>\n'
+        f'{_top}\n'
+        f'\u2502  \u23f0 Slot:    {slot_start_str} \u2013 {slot_end_str} UTC\n'
+        f'\u2502  \U0001faa3 Bucket:  {bucket or "n/a"}\n'
+        f'{_mid}\n'
+        f'\u2502  {reason_emoji} Reason:  {_e(reason)}\n'
+        f'{_bot}'
     )
 
 

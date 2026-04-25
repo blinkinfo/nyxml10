@@ -454,6 +454,7 @@ async def _check_and_trade() -> None:
                         slot_end_str=slot_end_str,
                         reason=f"Threshold policy {demo_route['policy']} blocked demo execution",
                         bucket=demo_route.get("bucket"),
+                        policy=demo_route.get("policy"),
                     )
                 )
             else:
@@ -494,6 +495,8 @@ async def _check_and_trade() -> None:
                             entry_price=demo_execution["entry_price"],
                             amount_usdc=amount_usdc,
                             new_bankroll=new_bankroll,
+                            slot_start_str=slot_start_str,
+                            slot_end_str=slot_end_str,
                         )
                     )
 
