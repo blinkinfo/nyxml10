@@ -32,7 +32,7 @@ AutoPoly monitors Polymarket's BTC-USDT 5-minute binary markets around the clock
 5. After slot expiry, **resolves** the outcome and **redeems** any winning positions on-chain
 6. Sends Telegram notifications for every key event
 
-The system supports both **demo** (simulated P&L) and **live** (real USDC on-chain) trading.
+The system supports both **demo** (simulated P&L) and **live** (real Polymarket USDC collateral on Polygon) trading.
 
 ---
 
@@ -101,7 +101,7 @@ nyxmlopp/
 | **Live** | Real USDC trades on Polymarket CLOB via `py-clob-client` |
 | **Demo** | Simulated trades — no real orders placed, P&L tracked in DB |
 
-Toggle via the `/demo` Telegram command or the `DEMO_MODE` environment variable.
+Toggle via the `/demo` Telegram command. Demo mode is stored in the database settings, not an environment variable.
 
 ### Demo Payout Structure
 
@@ -113,7 +113,7 @@ In demo mode, simulated P&L uses Polymarket-style binary payout:
 
 | Mode | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| **fixed** | `TRADE_MODE=fixed` | — | Fixed USDC amount per trade (set via `FIXED_STAKE`) |
+| **fixed** | `TRADE_MODE=fixed` | — | Fixed USDC collateral amount per trade (set via `TRADE_AMOUNT_USDC`) |
 | **pct** | `TRADE_MODE=pct` | `TRADE_PCT=5.0` | Percentage of available balance per trade |
 
 In PCT demo mode: win = `0.85 × stake` profit, lose = full stake loss.
@@ -267,11 +267,11 @@ T−85s  →  strategy.get_signal()
 
 Slot expiry → resolver.resolve_pending()   # check Polymarket outcome API
                 ↓ (win)
-              redeemer.redeem()            # on-chain USDC redemption
+              redeemer.redeem()            # on-chain collateral redemption
 ```
 
 **Additional scheduled jobs:**
-- Periodic redemption scan (interval configurable via `REDEMPTION_SCAN_INTERVAL`)
+- Periodic redemption scan (interval configurable via `AUTO_REDEEM_INTERVAL_MINUTES`)
 - Startup recovery: `recover_unresolved()` re-queues any trades that were open at last shutdown
 
 ---
@@ -329,27 +329,27 @@ Copy `.env.example` to `.env` and fill in all required values.
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Authorized Telegram chat ID (only this chat can control the bot) |
-| `POLY_API_KEY` | Polymarket CLOB API key |
-| `POLY_API_SECRET` | Polymarket CLOB API secret |
-| `POLY_API_PASSPHRASE` | Polymarket CLOB API passphrase |
-| `POLY_PRIVATE_KEY` | EVM wallet private key for on-chain redemption |
+| `POLYMARKET_PRIVATE_KEY` | EOA signer private key used for CLOB auth and on-chain redemption |
+| `POLYMARKET_FUNDER_ADDRESS` | Polymarket funder or proxy wallet address that holds funds/positions |
+| `POLYMARKET_SIGNATURE_TYPE` | CLOB signature type: `1` for direct EOA, `2` for proxy wallet/Safe flows |
+| `POLYGON_RPC_URL` | Polygon RPC used for redemption transactions and startup wallet checks |
 
 ### Trading
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEMO_MODE` | `true` | `true` = demo (simulated), `false` = live real trades |
+| Demo mode | DB setting | Managed live via Telegram settings; not configured via env |
 | `TRADE_MODE` | `fixed` | `fixed` = fixed stake per trade, `pct` = percentage of balance |
-| `FIXED_STAKE` | — | USDC amount per trade (used when `TRADE_MODE=fixed`) |
+| `TRADE_AMOUNT_USDC` | `1.0` | USDC collateral amount per trade (used when `TRADE_MODE=fixed`) |
 | `TRADE_PCT` | `5.0` | Percentage of balance per trade (used when `TRADE_MODE=pct`) |
-| `DEMO_BALANCE` | — | Starting virtual balance for demo mode |
+| Demo bankroll | DB setting | Managed live via Telegram settings; not configured via env |
 
 ### Strategy & Model
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `STRATEGY_NAME` | `ml` | Active strategy: `ml` or `pattern` |
-| `ML_DEFAULT_THRESHOLD` | `0.535` | Default ML confidence threshold (both UP and DOWN) |
+| `ML_PAYOUT_RATIO` | `0.85` | Training/backtest payout assumption used for ML threshold selection |
 | `ML_MODEL_DIR` | `./models` | Directory for LightGBM model files |
 
 ### System
@@ -358,7 +358,7 @@ Copy `.env.example` to `.env` and fill in all required values.
 |----------|---------|-------------|
 | `DB_PATH` | `autopoly.db` | Path to SQLite database file |
 | `SIGNAL_LEAD_TIME` | `85` | Seconds before slot end to fire signal check |
-| `REDEMPTION_SCAN_INTERVAL` | — | Minutes between automatic redemption scans |
+| `AUTO_REDEEM_INTERVAL_MINUTES` | `5` | Minutes between automatic redemption scans |
 
 ---
 
@@ -388,7 +388,7 @@ AutoPoly uses **aiosqlite** (async SQLite). Schema is auto-created and migrated 
 - Python 3.11+
 - MEXC account (public API, no auth needed for data)
 - Polymarket account with CLOB API credentials
-- EVM wallet funded with USDC on Polygon for live trading
+- Polymarket signer plus funded proxy or wallet on Polygon for live trading and redemption
 - Telegram bot token and authorized chat ID
 
 ### Installation

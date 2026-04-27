@@ -1,12 +1,12 @@
-"""Polymarket CLOB client wrapper — initialises ClobClient with API credentials."""
+"""Polymarket CLOB client wrapper -- initialises the V2 client with API credentials."""
 
 from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds
 
 if TYPE_CHECKING:
     import config as cfg
@@ -25,20 +25,20 @@ class PolymarketClient:
         self.client = ClobClient(
             host=config.CLOB_HOST,
             key=config.POLYMARKET_PRIVATE_KEY,
-            chain_id=config.CHAIN_ID,
+            chain=config.CHAIN_ID,
             signature_type=config.POLYMARKET_SIGNATURE_TYPE,
             funder=config.POLYMARKET_FUNDER_ADDRESS,
         )
 
-        # Step 2 — derive / fetch L2 API creds
-        creds = self.client.create_or_derive_api_creds()
+        # Step 2 -- derive / fetch L2 API creds
+        creds = self.client.create_or_derive_api_key()
         log.debug("API creds derived successfully.")
 
         # Step 3 — re-instantiate with creds for authenticated L2 trading
         self.client = ClobClient(
             host=config.CLOB_HOST,
             key=config.POLYMARKET_PRIVATE_KEY,
-            chain_id=config.CHAIN_ID,
+            chain=config.CHAIN_ID,
             signature_type=config.POLYMARKET_SIGNATURE_TYPE,
             funder=config.POLYMARKET_FUNDER_ADDRESS,
             creds=ApiCreds(

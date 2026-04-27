@@ -40,7 +40,7 @@ def _validate_config() -> bool:
     if not getattr(cfg, "POLYGON_RPC_URL", None):
         log.warning(
             "POLYGON_RPC_URL is not set — on-chain redemptions will fail. "
-            "Set this env var to enable /redeem and auto-redeem."
+            "Set this env var to enable redemption checks, /redeem, and auto-redeem."
         )
 
     return ok

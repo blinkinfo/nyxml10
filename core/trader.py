@@ -15,8 +15,8 @@ import time
 
 from typing import Any
 
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
+from py_clob_client_v2.order_builder.constants import BUY
 
 import config as cfg
 from db import queries
@@ -92,19 +92,44 @@ def _is_order_matched(response: dict[str, Any]) -> bool:
         return True
 
     # Legacy fallback: if no status field but orderID is present and success is True
-    if not status and response.get("success") is True and (
-        response.get("orderID") or response.get("order_id")
-    ):
+    if not status and response.get("success") is True and _extract_order_id(response):
         return True
 
     return False
+
+
+def _extract_nested_status(response: dict[str, Any]) -> str | None:
+    """Extract a normalized status from top-level or nested order payloads."""
+    if not isinstance(response, dict):
+        return None
+    for key in ("status", "orderStatus", "order_status"):
+        value = response.get(key)
+        if value:
+            return str(value).upper()
+    for key in ("order", "data"):
+        nested = response.get(key)
+        if isinstance(nested, dict):
+            for nested_key in ("status", "orderStatus", "order_status"):
+                value = nested.get(nested_key)
+                if value:
+                    return str(value).upper()
+    return None
 
 
 def _extract_order_id(response: dict[str, Any]) -> str | None:
     """Extract the order ID from a CLOB response."""
     if not isinstance(response, dict):
         return None
-    return response.get("orderID") or response.get("order_id")
+    order_id = response.get("orderID") or response.get("order_id") or response.get("id")
+    if order_id:
+        return order_id
+    for key in ("order", "data"):
+        nested = response.get(key)
+        if isinstance(nested, dict):
+            nested_id = nested.get("orderID") or nested.get("order_id") or nested.get("id")
+            if nested_id:
+                return nested_id
+    return None
 
 
 def _seconds_until_slot_end(slot_end_ts: int) -> float:
@@ -195,7 +220,7 @@ async def place_fok_order_with_retry(
             return _build_result("filled", last_order_id, attempt, "Order matched successfully")
 
         # Not matched -- log the status
-        clob_status = response.get("status", "UNKNOWN") if isinstance(response, dict) else "UNKNOWN"
+        clob_status = _extract_nested_status(response) or "UNKNOWN"
         log.warning(
             "Trade %d: attempt %d/%d NOT matched (CLOB status=%s, order_id=%s)",
             trade_id, attempt, max_retries, clob_status, last_order_id,

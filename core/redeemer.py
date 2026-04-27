@@ -13,7 +13,7 @@ Flow
 Contracts (Polygon mainnet)
 ---------------------------
 CTF (ConditionalTokens):  0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
-USDC.e collateral:        0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+Primary USDC collateral:  0x3c499c542cef5e3811e1192ce70d8cc03d5c3359
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # Contract addresses (Polygon mainnet)
 # ---------------------------------------------------------------------------
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_ADDRESS = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
 # Minimal ABI — only the methods we actually call
 _CTF_ABI = [
@@ -238,7 +238,7 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
          Prices in-between mean the market is still live -- skip those.
 
     The on-chain redeemPositions() call with index_sets=[1, 2] handles both
-    outcomes correctly: winning tokens are redeemed for USDC, losing tokens
+    outcomes correctly: winning tokens are redeemed for the current Polymarket USDC collateral, losing tokens
     are burned for $0. Calling it for a lost position is safe and necessary
     to clear worthless ERC-1155 tokens from the wallet.
 
@@ -298,6 +298,7 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
 
 async def redeem_position(
     condition_id_hex: str,
+    collateral_token: str | None = None,
 ) -> dict[str, Any]:
     """Call CTF.redeemPositions() on Polygon for one condition.
 
@@ -365,7 +366,7 @@ def _redeem_position_sync(
         # EOA = the account derived from the private key
         eoa_account = w3.eth.account.from_key(private_key).address
 
-        collateral = Web3.to_checksum_address(USDC_E_ADDRESS)
+        collateral = Web3.to_checksum_address(USDC_ADDRESS)
 
         # parentCollectionId = 0x00...00 (top-level condition)
         parent_collection_id = b"\x00" * 32
@@ -796,7 +797,7 @@ async def scan_and_redeem(
             })
             continue
 
-        result = await redeem_position(pos["condition_id"])
+        result = await redeem_position(pos["condition_id"], pos.get("collateral_token"))
         results.append({
             **pos,
             **result,

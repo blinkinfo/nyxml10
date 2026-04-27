@@ -25,20 +25,22 @@ _USDC_DECIMALS = 1_000_000
 
 
 async def get_balance(poly_client) -> float | None:
-    """Return USDC balance (float, rounded to 2 dp) for the wallet.
+    """Return collateral balance (float, rounded to 2 dp) for the wallet.
 
-    Uses ClobClient.get_balance_allowance() with AssetType.COLLATERAL --
-    the correct py-clob-client method for on-chain USDC balance.
-    The returned 'balance' field is a wei string (6 decimals for USDC).
+    Uses the V2 get_balance_allowance helper with collateral semantics while
+    preserving the existing float return shape for callers.
 
     Returns None on any error so the caller can display 'N/A'.
     """
     try:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams  # type: ignore
 
         result: dict[str, Any] = await asyncio.to_thread(
             poly_client.client.get_balance_allowance,
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=getattr(poly_client.config, "POLYMARKET_SIGNATURE_TYPE", -1),
+            ),
         )
 
         if not isinstance(result, dict):

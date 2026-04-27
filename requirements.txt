@@ -1,4 +1,4 @@
-py-clob-client>=0.34.0
+py-clob-client-v2>=1.0.0
 python-telegram-bot>=20.0
 httpx>=0.25.0
 apscheduler>=3.10.0

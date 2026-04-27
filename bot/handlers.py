@@ -746,7 +746,7 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
         return
     results: list[dict] = []
     for pos in preview:
-        result = await redeem_position(pos["condition_id"])
+        result = await redeem_position(pos["condition_id"], pos.get("collateral_token"))
         merged = {**pos, **result, "dry_run": False}
         results.append(merged)
         try:

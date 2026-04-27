@@ -15,6 +15,49 @@ log = logging.getLogger(__name__)
 SLOT_DURATION = 300  # 5 minutes in seconds
 
 
+def _normalize_json_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return []
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _extract_price_levels(data: Any, side: str) -> list[float]:
+    levels = data.get(side, []) if isinstance(data, dict) else []
+    prices: list[float] = []
+    if isinstance(levels, list):
+        for level in levels:
+            try:
+                if isinstance(level, dict):
+                    price = level.get("price")
+                elif isinstance(level, (list, tuple)) and level:
+                    price = level[0]
+                else:
+                    price = None
+                if price is not None:
+                    prices.append(float(price))
+            except Exception:
+                continue
+    return prices
+
+
+def _extract_outcome_token_ids(market: dict[str, Any]) -> tuple[str, str] | None:
+    outcomes = _normalize_json_list(market.get("outcomes") or market.get("outcomeNames") or market.get("outcome_names"))
+    token_ids = _normalize_json_list(market.get("clobTokenIds") or market.get("tokenIds") or market.get("token_ids"))
+    if not outcomes or not token_ids or len(outcomes) != len(token_ids):
+        return None
+    normalized = {str(outcome).strip().lower(): str(token_ids[idx]) for idx, outcome in enumerate(outcomes)}
+    up = normalized.get("up")
+    down = normalized.get("down")
+    if up and down:
+        return up, down
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Slot boundary helpers
 # ---------------------------------------------------------------------------
@@ -114,20 +157,28 @@ async def get_clob_best_ask(token_id: str, client: httpx.AsyncClient) -> float |
         log.exception("CLOB /book request failed for token_id=%s", token_id)
         return None
 
-    asks = data.get("asks", [])
-    if not asks:
-        log.warning("CLOB /book returned empty asks for token_id=%s", token_id)
+    prices = _extract_price_levels(data, "asks")
+    if not prices:
+        try:
+            price_response = await client.get(f"{cfg.CLOB_HOST}/price", params={"token_id": token_id, "side": "BUY"})
+            price_response.raise_for_status()
+            price_data = price_response.json()
+            fallback_price = price_data.get("price") if isinstance(price_data, dict) else None
+            if fallback_price is not None:
+                return float(fallback_price)
+        except Exception:
+            log.debug("CLOB /price fallback failed for token_id=%s", token_id, exc_info=True)
+        log.warning("CLOB pricing returned no asks for token_id=%s", token_id)
         return None
 
     try:
         # Explicitly take the minimum price across all ask levels rather than
-        # relying on the API's sort order — robust to any future changes in
+        # relying on the API's sort order -- robust to any future changes in
         # how Polymarket returns the data.
-        prices = [float(a["price"]) for a in asks]
         best_ask = min(prices)
         log.debug(
             "CLOB best ask for token_id=%s: %.4f (book range: %.4f-%.4f, %d levels)",
-            token_id, best_ask, min(prices), max(prices), len(asks),
+            token_id, best_ask, min(prices), max(prices), len(prices),
         )
         return best_ask
     except (KeyError, ValueError, IndexError):
@@ -171,21 +222,10 @@ async def get_slot_prices(slug: str) -> dict[str, Any] | None:
     market = data[0]
 
     try:
-        outcomes_raw = market["outcomes"]
-        token_ids_raw = market["clobTokenIds"]
-
-        # Gamma API may return these fields as JSON-encoded strings
-        if isinstance(outcomes_raw, str):
-            outcomes_raw = json.loads(outcomes_raw)
-        if isinstance(token_ids_raw, str):
-            token_ids_raw = json.loads(token_ids_raw)
-
-        up_idx = outcomes_raw.index("Up")
-        down_idx = outcomes_raw.index("Down")
-
-        token_ids = [str(t) for t in token_ids_raw]
-        up_token_id = token_ids[up_idx]
-        down_token_id = token_ids[down_idx]
+        token_pair = _extract_outcome_token_ids(market)
+        if not token_pair:
+            raise ValueError("missing Up/Down token mapping")
+        up_token_id, down_token_id = token_pair
 
     except (KeyError, ValueError, IndexError):
         log.exception("Failed to parse Gamma market data for slug=%s", slug)

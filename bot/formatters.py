@@ -1017,7 +1017,7 @@ def format_help() -> str:
         "<b>Auto-Redeem:</b>\n"
         "When enabled, the bot periodically scans your wallet for resolved "
         "winning positions and calls redeemPositions() on the Polygon CTF "
-        "contract to collect your USDC.e. Use /redeem for a manual scan."
+        "contract to collect settled USDC collateral. Use /redeem for a manual scan."
         + SEP
     )
 
