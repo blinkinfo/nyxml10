@@ -840,7 +840,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["awaiting_rolling_wr_import"] = True
         context.user_data.pop("rolling_wr_import_preview", None)
         await query.answer()
-        await _safe_edit(query, format_rolling_wr_import_instructions(), reply_markup=rolling_wr_back_keyboard())
+        config = await queries.get_rolling_wr_config()
+        await _safe_edit(query, format_rolling_wr_import_instructions(config), reply_markup=rolling_wr_back_keyboard())
     elif data == "rolling_wr_toggle":
         config = await queries.get_rolling_wr_config()
         await queries.set_rolling_wr_enabled(not config["enabled"])
@@ -911,7 +912,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("rolling_wr_import_preview", None)
             context.user_data["awaiting_rolling_wr_import"] = False
             await query.answer("Rolling WR import applied")
-            await _safe_edit(query, format_rolling_wr_import_success(preview, result), reply_markup=rolling_wr_back_keyboard())
+            await _safe_edit(query, format_rolling_wr_import_success(result), reply_markup=rolling_wr_back_keyboard())
     elif data == "rolling_wr_import_cancel":
         context.user_data.pop("rolling_wr_import_preview", None)
         context.user_data["awaiting_rolling_wr_import"] = False

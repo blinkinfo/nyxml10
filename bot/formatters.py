@@ -1424,7 +1424,7 @@ def format_rolling_wr_dashboard(status: dict[str, Any]) -> str:
         f"Feature: {'ON' if status.get('enabled') else 'OFF'}",
         f"WR: {wr} over {status.get('sample_size', 0)}/{status.get('window_size', 0)}",
         f"Policy: {policy} | {ready_text}",
-        f"Thresholds: follow < {status.get('follow_below', 0):.2f}% | invert > {status.get('invert_above', 0):.2f}%",
+        f"Thresholds: follow &lt; {status.get('follow_below', 0):.2f}% | invert &gt; {status.get('invert_above', 0):.2f}%",
         f"Reason: {status.get('reason', 'n/a')}",
         f"Active window: import {source_mix.get('window_import_count', 0)} | live {source_mix.get('window_live_count', 0)}",
         f"Last import: {source}",
