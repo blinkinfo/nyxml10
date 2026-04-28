@@ -380,10 +380,32 @@ def format_trade_filled(
     shares: float | None,
     order_id: str | None,
     attempts: int,
+    original_side: str | None = None,
+    policy: str | None = None,
+    bucket: str | None = None,
 ) -> str:
-    """Rich fill confirmation box sent when a FOK order is MATCHED."""
+    """Rich fill confirmation box sent when a FOK order is matched.
+
+    Extra routing metadata is optional so callers can pass richer threshold-
+    policy context without breaking older call sites.
+    """
     side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
     attempt_note = f" (attempt {attempts})" if attempts > 1 else ""
+
+    routing_line = ""
+    if policy == "INVERT" and original_side and original_side != side:
+        original_emoji = "\U0001f4c8" if original_side == "Up" else "\U0001f4c9"
+        routing_line = (
+            f"\u2502 \U0001f501 Routed: {original_emoji} {original_side} \u2192 {side_emoji} {side}"
+        )
+        if bucket:
+            routing_line += f"  \U0001faa3 {bucket}"
+        routing_line += "\n"
+    elif bucket or policy:
+        policy_text = _e(policy) if policy else "DIRECT"
+        bucket_text = _e(bucket) if bucket else "n/a"
+        routing_line = f"\u2502 \U0001faa3 Policy/Bucket: {policy_text} / {bucket_text}\n"
+
     shares_line = ""
     if shares is not None:
         shares_line = f"\u2502 \U0001f4ca Shares: {shares:.4f}\n"
@@ -395,6 +417,7 @@ def format_trade_filled(
         f"\u2705 <b>Trade FILLED{attempt_note}</b>\n"
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 {side_emoji} Side: {side}  \u23f0 {slot_label}\n"
+        f"{routing_line}"
         f"\u2502 \U0001f4b2 Ask Price: ${ask_price:.4f}\n"
         f"\u2502 \U0001f4b5 Amount: ${amount_usdc:.2f} USDC\n"
         f"{shares_line}"
