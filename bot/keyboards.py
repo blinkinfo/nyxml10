@@ -42,7 +42,10 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f500 Thresholds", callback_data="cmd_thresholds"),
         ],
         [
+            InlineKeyboardButton("\U0001f4c8 Rolling WR", callback_data="cmd_rolling_wr"),
             InlineKeyboardButton("\u2753 Help", callback_data="cmd_help"),
+        ],
+        [
             InlineKeyboardButton("\U0001f3e0 Home", callback_data="cmd_menu"),
         ],
     ])
@@ -356,3 +359,48 @@ def threshold_cancel_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('\u274c Cancel', callback_data=f'thresholds_{mode}')],
     ])
+
+
+def rolling_wr_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="rolling_wr_settings"),
+            InlineKeyboardButton("\U0001f4ca Analytics", callback_data="rolling_wr_analytics"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f4e5 Warm Start Import", callback_data="rolling_wr_import"),
+            InlineKeyboardButton("\U0001f4dc History", callback_data="rolling_wr_history"),
+        ],
+        [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
+def rolling_wr_settings_keyboard(enabled: bool, skip_when_unready: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Feature: {'ON' if enabled else 'OFF'}", callback_data="rolling_wr_toggle")],
+        [
+            InlineKeyboardButton("Set Window", callback_data="rolling_wr_set_window"),
+            InlineKeyboardButton("Set Min Samples", callback_data="rolling_wr_set_min_samples"),
+        ],
+        [
+            InlineKeyboardButton("Set Follow <", callback_data="rolling_wr_set_follow_below"),
+            InlineKeyboardButton("Set Invert >", callback_data="rolling_wr_set_invert_above"),
+        ],
+        [InlineKeyboardButton(f"Warm-up: {'SKIP' if skip_when_unready else 'FOLLOW'}", callback_data="rolling_wr_toggle_skip_unready")],
+        [InlineKeyboardButton("Reset Defaults", callback_data="rolling_wr_reset_defaults")],
+        [InlineKeyboardButton("\u2190 Back to Rolling WR", callback_data="cmd_rolling_wr")],
+    ])
+
+
+def rolling_wr_import_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u2705 Confirm Import", callback_data="rolling_wr_import_confirm"),
+            InlineKeyboardButton("\u274c Cancel", callback_data="rolling_wr_import_cancel"),
+        ],
+        [InlineKeyboardButton("\u2190 Back to Rolling WR", callback_data="cmd_rolling_wr")],
+    ])
+
+
+def rolling_wr_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("\u2190 Back to Rolling WR", callback_data="cmd_rolling_wr")]])

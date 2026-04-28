@@ -36,6 +36,13 @@ from bot.formatters import (
     format_redemption_history,
     format_retrain_blocked,
     format_retrain_complete,
+    format_rolling_wr_analytics,
+    format_rolling_wr_dashboard,
+    format_rolling_wr_history,
+    format_rolling_wr_import_instructions,
+    format_rolling_wr_import_preview,
+    format_rolling_wr_import_success,
+    format_rolling_wr_settings,
     format_set_threshold,
     format_set_down_threshold,
     format_signal_stats,
@@ -54,6 +61,10 @@ from bot.keyboards import (
     redeem_confirm_keyboard,
     redeem_done_keyboard,
     retrain_blocked_keyboard,
+    rolling_wr_back_keyboard,
+    rolling_wr_import_preview_keyboard,
+    rolling_wr_menu,
+    rolling_wr_settings_keyboard,
     settings_keyboard,
     signal_filter_row,
     threshold_analytics_keyboard,
@@ -69,6 +80,182 @@ from polymarket import account as pm_account
 
 log = logging.getLogger(__name__)
 MAX_ML_THRESHOLD = 0.95
+
+
+def _parse_rolling_wr_percent(raw: str) -> float:
+    value = float(raw.strip().replace('%', ''))
+    if value < 0 or value > 100:
+        raise ValueError('out of range')
+    return round(value, 4)
+
+
+def _parse_positive_int(raw: str) -> int:
+    value = int(float(raw.strip()))
+    if value <= 0:
+        raise ValueError('non-positive')
+    return value
+
+
+def _coerce_excel_preview_rows(rows: list[dict[str, Any]], window_size: int) -> list[dict[str, Any]]:
+    deduped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        deduped[int(row['slot_timestamp'])] = row
+    ordered = [deduped[k] for k in sorted(deduped)]
+    return ordered[-window_size:]
+
+
+def _extract_rolling_wr_preview_from_workbook(file_bytes: bytes, filename: str, window_size: int, config: dict[str, Any]) -> dict[str, Any]:
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+    values = list(ws.iter_rows(values_only=True))
+    if not values:
+        raise ValueError('Workbook is empty')
+    headers = [str(v).strip() if v is not None else '' for v in values[0]]
+    header_map = {h: i for i, h in enumerate(headers)}
+    if 'slot_start' not in header_map or 'is_win' not in header_map or ('model_side' not in header_map and 'side' not in header_map):
+        raise ValueError('Required columns: slot_start, is_win, and model_side or side')
+
+    rows_found = 0
+    rejected = 0
+    eligible: list[dict[str, Any]] = []
+    for raw in values[1:]:
+        if all(v is None or str(v).strip() == '' for v in raw):
+            continue
+        rows_found += 1
+        slot_start = raw[header_map['slot_start']]
+        side_idx = header_map.get('model_side', header_map.get('side'))
+        original_side = raw[side_idx]
+        is_win_value = raw[header_map['is_win']]
+        if slot_start is None or original_side is None or is_win_value is None:
+            rejected += 1
+            continue
+        side = str(original_side).strip()
+        if side not in {'Up', 'Down'}:
+            rejected += 1
+            continue
+        normalized = str(is_win_value).strip().lower()
+        if normalized in {'1', '1.0', 'true', 'yes', 'win'}:
+            is_correct = 1
+        elif normalized in {'0', '0.0', 'false', 'no', 'loss'}:
+            is_correct = 0
+        else:
+            try:
+                is_correct = 1 if int(float(normalized)) == 1 else 0
+            except Exception:
+                rejected += 1
+                continue
+        slot_str = str(slot_start).strip()
+        try:
+            parsed_dt = datetime.fromisoformat(slot_str.replace('Z', '+00:00'))
+            slot_timestamp = int(parsed_dt.timestamp())
+        except Exception:
+            try:
+                parsed_dt = datetime.strptime(slot_str, '%Y-%m-%d %H:%M:%S')
+                slot_timestamp = int(parsed_dt.replace(tzinfo=timezone.utc).timestamp())
+            except Exception:
+                rejected += 1
+                continue
+        winner_side = side if is_correct else ('Down' if side == 'Up' else 'Up')
+        eligible.append({
+            'slot_timestamp': slot_timestamp,
+            'slot_start': slot_str,
+            'signal_slug': None,
+            'original_side': side,
+            'winner_side': winner_side,
+            'is_correct': is_correct,
+        })
+
+    trimmed = _coerce_excel_preview_rows(eligible, window_size)
+    sample_size = len(trimmed)
+    wins = sum(1 for row in trimmed if row['is_correct'] == 1)
+    losses = sample_size - wins
+    win_rate = round((wins / sample_size) * 100, 2) if sample_size else None
+    ready = sample_size >= config['min_samples']
+    if not config['enabled']:
+        policy = 'FOLLOW'
+        reason = 'rolling WR disabled'
+    elif not ready:
+        policy = 'SKIP' if config['skip_when_unready'] else 'FOLLOW'
+        reason = 'warming up'
+    elif win_rate is not None and win_rate > config['invert_above']:
+        policy = 'INVERT'
+        reason = 'above invert threshold'
+    elif win_rate is not None and win_rate < config['follow_below']:
+        policy = 'FOLLOW'
+        reason = 'below follow threshold'
+    else:
+        policy = 'SKIP'
+        reason = 'neutral zone'
+    status = {
+        'enabled': config['enabled'],
+        'policy': policy,
+        'win_rate': win_rate,
+        'sample_size': sample_size,
+        'window_size': window_size,
+        'min_samples': config['min_samples'],
+        'ready': ready,
+        'wins': wins,
+        'losses': losses,
+        'follow_below': config['follow_below'],
+        'invert_above': config['invert_above'],
+        'skip_when_unready': config['skip_when_unready'],
+        'reason': reason,
+    }
+    return {
+        'filename': filename,
+        'rows_found': rows_found,
+        'eligible_rows': len(eligible),
+        'rejected_rows': rejected,
+        'rows': trimmed,
+        'status': status,
+    }
+
+
+async def _render_rolling_wr_hub(update: Update) -> None:
+    status = await queries.evaluate_rolling_wr()
+    text = format_rolling_wr_dashboard(status)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=rolling_wr_menu())
+    else:
+        await update.message.reply_text(text, reply_markup=rolling_wr_menu(), parse_mode='HTML')
+
+
+async def _render_rolling_wr_settings(update: Update) -> None:
+    config = await queries.get_rolling_wr_config()
+    status = await queries.evaluate_rolling_wr()
+    text = format_rolling_wr_settings(config, status)
+    kb = rolling_wr_settings_keyboard(config['enabled'], config['skip_when_unready'])
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode='HTML')
+
+
+async def _render_rolling_wr_analytics(update: Update) -> None:
+    data = await queries.get_rolling_wr_analytics()
+    text = format_rolling_wr_analytics(data)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=rolling_wr_back_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=rolling_wr_back_keyboard(), parse_mode='HTML')
+
+
+async def _render_rolling_wr_history(update: Update) -> None:
+    data = await queries.get_rolling_wr_analytics()
+    text = format_rolling_wr_history(data)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await _safe_edit(update.callback_query, text, reply_markup=rolling_wr_back_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=rolling_wr_back_keyboard(), parse_mode='HTML')
+
+
+@auth_check
+async def cmd_rolling_wr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _render_rolling_wr_hub(update)
 
 
 def _parse_ml_threshold(raw: str) -> float:
@@ -363,9 +550,11 @@ async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer("Preparing Excel...")
     headers = [
-        "id", "slot_start", "side", "model_side", "entry_price", "is_win", "pattern",
+        "id", "slot_start", "slot_timestamp", "side", "model_side", "entry_price", "is_win", "pattern",
         "ml_p_up", "ml_p_down", "ml_probability_bucket", "ml_probability_used",
         "threshold_policy_real", "threshold_policy_demo",
+        "rolling_wr_policy", "rolling_wr_wr", "rolling_wr_window_size", "rolling_wr_sample_size",
+        "rolling_wr_follow_below", "rolling_wr_invert_above", "rolling_wr_ready",
     ]
     await _reply_with_excel_export(
         query=query,
@@ -385,7 +574,8 @@ async def cmd_download_trades_excel(update: Update, context: ContextTypes.DEFAUL
         "id", "signal_id", "slot_start", "slot_end", "side", "entry_price", "amount_usdc",
         "order_id", "fill_price", "status", "retry_count", "outcome", "is_win", "pnl",
         "resolved_at", "routing_mode", "routing_policy", "original_side", "routed_side",
-        "policy_bucket", "policy_probability",
+        "policy_bucket", "policy_probability", "rolling_wr_policy", "rolling_wr_wr",
+        "rolling_wr_window_size", "rolling_wr_sample_size", "rolling_wr_ready",
     ]
     await _reply_with_excel_export(
         query=query,
@@ -405,7 +595,8 @@ async def cmd_download_demo_trades_excel(update: Update, context: ContextTypes.D
         "id", "signal_id", "slot_start", "slot_end", "side", "entry_price", "amount_usdc",
         "order_id", "fill_price", "status", "retry_count", "outcome", "is_win", "pnl",
         "resolved_at", "routing_mode", "routing_policy", "original_side", "routed_side",
-        "policy_bucket", "policy_probability",
+        "policy_bucket", "policy_probability", "rolling_wr_policy", "rolling_wr_wr",
+        "rolling_wr_window_size", "rolling_wr_sample_size", "rolling_wr_ready",
     ]
     await _reply_with_excel_export(
         query=query,
@@ -893,6 +1084,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"\u2705 Trade amount updated to <b>${amount:.2f}</b>", parse_mode="HTML")
 
 
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("awaiting_rolling_wr_import"):
+        return
+    doc = update.message.document
+    if not doc or not (doc.file_name or '').lower().endswith('.xlsx'):
+        await update.message.reply_text("❌ Please upload an .xlsx export file.", parse_mode="HTML")
+        return
+    tg_file = await doc.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+    config = await queries.get_rolling_wr_config()
+    try:
+        preview = _extract_rolling_wr_preview_from_workbook(bytes(file_bytes), doc.file_name or 'signals.xlsx', config['window_size'], config)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Import failed: {_html.escape(str(exc))}", parse_mode="HTML", reply_markup=rolling_wr_back_keyboard())
+        return
+    context.user_data["rolling_wr_import_preview"] = preview
+    context.user_data["awaiting_rolling_wr_import"] = False
+    await update.message.reply_text(
+        format_rolling_wr_import_preview(preview),
+        parse_mode="HTML",
+        reply_markup=rolling_wr_import_preview_keyboard(),
+    )
+
+
 def register(application) -> None:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("status", cmd_status))
@@ -904,6 +1119,7 @@ def register(application) -> None:
     application.add_handler(CommandHandler("redemptions", cmd_redemptions))
     application.add_handler(CommandHandler("demo", cmd_demo))
     application.add_handler(CommandHandler("patterns", cmd_patterns))
+    application.add_handler(CommandHandler("rolling_wr", cmd_rolling_wr))
     application.add_handler(CommandHandler("thresholds", cmd_thresholds))
     application.add_handler(CommandHandler("threshold_stats", cmd_threshold_stats))
     application.add_handler(CommandHandler("set_threshold", cmd_set_threshold))
@@ -915,6 +1131,7 @@ def register(application) -> None:
     application.add_handler(CommandHandler("promote_model", cmd_promote_model))
     application.add_handler(CommandHandler("retrain", cmd_retrain))
     application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     async def _error_handler(update, context):

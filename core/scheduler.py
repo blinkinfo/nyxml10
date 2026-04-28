@@ -76,6 +76,12 @@ def _build_routed_execution(signal: dict, route: dict, mode: str) -> dict | None
         "probability": route["probability"],
         "original_side": route["original_side"],
         "reason": route.get("reason"),
+        "rolling_wr_policy": route.get("rolling_wr_policy"),
+        "rolling_wr_wr": route.get("rolling_wr_wr"),
+        "rolling_wr_window_size": route.get("rolling_wr_window_size"),
+        "rolling_wr_sample_size": route.get("rolling_wr_sample_size"),
+        "rolling_wr_ready": route.get("rolling_wr_ready"),
+        "rolling_wr_reason": route.get("rolling_wr_reason"),
     }
 
 
@@ -149,7 +155,18 @@ async def _resolve_trade_bundle(
         return
 
     signal_is_win = winner == signal_side
-    await queries.mark_signal_resolved_if_unset(signal_id, winner, signal_is_win)
+    updated = await queries.mark_signal_resolved_if_unset(signal_id, winner, signal_is_win)
+    if updated:
+        signal_row = await queries.get_signal_by_id(signal_id)
+        if signal_row:
+            await queries.append_rolling_wr_live_result(
+                signal_id=signal_id,
+                slot_timestamp=signal_row["slot_timestamp"],
+                slot_start=signal_row.get("slot_start"),
+                signal_slug=signal_row.get("signal_slug"),
+                original_side=signal_row.get("model_side") or signal_row.get("side"),
+                winner_side=winner,
+            )
     inference_logger.log_outcome(slug, winner=winner, is_win=signal_is_win)
 
     s_start = slot_start.split(" ")[-1] if " " in slot_start else slot_start
@@ -226,7 +243,18 @@ async def _reconcile_pending() -> None:
             continue
         signal_side = item["side"]
         signal_id = item["signal_id"]
-        await queries.mark_signal_resolved_if_unset(signal_id, winner, winner == signal_side)
+        updated = await queries.mark_signal_resolved_if_unset(signal_id, winner, winner == signal_side)
+        if updated:
+            signal_row = await queries.get_signal_by_id(signal_id)
+            if signal_row:
+                await queries.append_rolling_wr_live_result(
+                    signal_id=signal_id,
+                    slot_timestamp=signal_row["slot_timestamp"],
+                    slot_start=signal_row.get("slot_start"),
+                    signal_slug=signal_row.get("signal_slug"),
+                    original_side=signal_row.get("model_side") or signal_row.get("side"),
+                    winner_side=winner,
+                )
         inference_logger.log_outcome(item["slug"], winner=winner, is_win=(winner == signal_side))
         trades = await queries.get_trades_by_signal(signal_id)
         for trade_row in trades:
@@ -372,11 +400,23 @@ async def _check_and_trade() -> None:
         routing_probability = signal.get("routing_probability")
         routing_bucket = signal.get("routing_bucket")
 
+        rolling_status = await queries.evaluate_rolling_wr()
+        rolling_policy = rolling_status["policy"]
+        if rolling_policy == "INVERT":
+            rolling_side = queries.invert_side(model_side)
+            rolling_blocked = False
+        elif rolling_policy == "SKIP":
+            rolling_side = None
+            rolling_blocked = True
+        else:
+            rolling_side = model_side
+            rolling_blocked = False
+
         legacy_invert_trades = await queries.is_invert_trades_enabled()
         legacy_blocked_ranges = await queries.get_blocked_threshold_ranges()
 
         real_route = await queries.decide_threshold_route(
-            original_side=model_side,
+            original_side=rolling_side or model_side,
             probability=routing_probability,
             bucket=routing_bucket,
             mode="real",
@@ -384,13 +424,26 @@ async def _check_and_trade() -> None:
             legacy_blocked_ranges=legacy_blocked_ranges,
         )
         demo_route = await queries.decide_threshold_route(
-            original_side=model_side,
+            original_side=rolling_side or model_side,
             probability=routing_probability,
             bucket=routing_bucket,
             mode="demo",
             legacy_invert_enabled=False,
             legacy_blocked_ranges=legacy_blocked_ranges,
         )
+
+        for route in (real_route, demo_route):
+            route["rolling_wr_policy"] = rolling_policy
+            route["rolling_wr_wr"] = rolling_status.get("win_rate")
+            route["rolling_wr_window_size"] = rolling_status.get("window_size")
+            route["rolling_wr_sample_size"] = rolling_status.get("sample_size")
+            route["rolling_wr_ready"] = rolling_status.get("ready")
+            route["rolling_wr_reason"] = rolling_status.get("reason")
+            if rolling_blocked:
+                route["blocked"] = True
+                route["routed_side"] = None
+                existing_reason = route.get("reason")
+                route["reason"] = rolling_status.get("reason") if not existing_reason else f"{rolling_status.get('reason')}; {existing_reason}"
 
         signal_id = await queries.insert_signal(
             slot_start=slot_start_full,
@@ -409,6 +462,14 @@ async def _check_and_trade() -> None:
             threshold_policy_demo=demo_route["policy"],
             model_side=model_side,
             signal_slug=slug,
+            rolling_wr_policy=rolling_policy,
+            rolling_wr_wr=rolling_status.get("win_rate"),
+            rolling_wr_window_size=rolling_status.get("window_size"),
+            rolling_wr_sample_size=rolling_status.get("sample_size"),
+            rolling_wr_follow_below=rolling_status.get("follow_below"),
+            rolling_wr_invert_above=rolling_status.get("invert_above"),
+            rolling_wr_ready=rolling_status.get("ready"),
+            rolling_wr_source="live+import",
         )
 
         demo_trade_enabled = await queries.is_demo_trade_enabled()
@@ -452,7 +513,7 @@ async def _check_and_trade() -> None:
                     format_demo_trade_skipped(
                         slot_start_str=slot_start_str,
                         slot_end_str=slot_end_str,
-                        reason=f"Threshold policy {demo_route['policy']} blocked demo execution",
+                        reason=demo_route.get("reason") or f"Threshold policy {demo_route['policy']} blocked demo execution",
                         bucket=demo_route.get("bucket"),
                         policy=demo_route.get("policy"),
                     )
@@ -485,6 +546,11 @@ async def _check_and_trade() -> None:
                         routed_side=demo_execution["side"],
                         policy_bucket=demo_execution["bucket"],
                         policy_probability=demo_execution["probability"],
+                        rolling_wr_policy=demo_execution.get("rolling_wr_policy"),
+                        rolling_wr_wr=demo_execution.get("rolling_wr_wr"),
+                        rolling_wr_window_size=demo_execution.get("rolling_wr_window_size"),
+                        rolling_wr_sample_size=demo_execution.get("rolling_wr_sample_size"),
+                        rolling_wr_ready=demo_execution.get("rolling_wr_ready"),
                     )
                     await _send_telegram(
                         format_demo_trade_placed(
@@ -506,7 +572,7 @@ async def _check_and_trade() -> None:
                     format_trade_aborted(
                         side=model_side,
                         slot_label=f"{slot_start_str}-{slot_end_str}",
-                        reason=f"Threshold policy {real_route['policy']} blocked real execution",
+                        reason=real_route.get("reason") or f"Threshold policy {real_route['policy']} blocked real execution",
                     )
                 )
             elif real_execution["token_id"]:
@@ -525,6 +591,11 @@ async def _check_and_trade() -> None:
                     routed_side=real_execution["side"],
                     policy_bucket=real_execution["bucket"],
                     policy_probability=real_execution["probability"],
+                    rolling_wr_policy=real_execution.get("rolling_wr_policy"),
+                    rolling_wr_wr=real_execution.get("rolling_wr_wr"),
+                    rolling_wr_window_size=real_execution.get("rolling_wr_window_size"),
+                    rolling_wr_sample_size=real_execution.get("rolling_wr_sample_size"),
+                    rolling_wr_ready=real_execution.get("rolling_wr_ready"),
                 )
                 trade_id_for_watch = trade_id
                 slot_end_ts = slot_ts + SLOT_DURATION

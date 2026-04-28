@@ -25,8 +25,43 @@ CREATE TABLE IF NOT EXISTS signals (
     ml_probability_used REAL,
     threshold_policy_real TEXT,
     threshold_policy_demo TEXT,
+    rolling_wr_policy TEXT,
+    rolling_wr_wr REAL,
+    rolling_wr_window_size INTEGER,
+    rolling_wr_sample_size INTEGER,
+    rolling_wr_follow_below REAL,
+    rolling_wr_invert_above REAL,
+    rolling_wr_ready INTEGER DEFAULT 0,
+    rolling_wr_source TEXT,
     model_side TEXT,
     signal_slug TEXT
+);
+
+CREATE TABLE IF NOT EXISTS rolling_wr_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER,
+    slot_timestamp INTEGER NOT NULL,
+    slot_start TEXT,
+    signal_slug TEXT,
+    original_side TEXT NOT NULL,
+    winner_side TEXT NOT NULL,
+    is_correct INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
+    imported_batch_id INTEGER,
+    imported_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (signal_id) REFERENCES signals(id),
+    FOREIGN KEY (imported_batch_id) REFERENCES rolling_wr_import_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS rolling_wr_import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source_filename TEXT,
+    replace_existing INTEGER NOT NULL DEFAULT 0,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    window_size_hint INTEGER,
+    notes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -54,6 +89,11 @@ CREATE TABLE IF NOT EXISTS trades (
     routed_side TEXT,
     policy_bucket TEXT,
     policy_probability REAL,
+    rolling_wr_policy TEXT,
+    rolling_wr_wr REAL,
+    rolling_wr_window_size INTEGER,
+    rolling_wr_sample_size INTEGER,
+    rolling_wr_ready INTEGER DEFAULT 0,
     signal_outcome_recorded INTEGER DEFAULT 0,
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 );
@@ -124,6 +164,12 @@ CREATE INDEX IF NOT EXISTS idx_trades_policy_mode_bucket
 ON trades (is_demo, policy_bucket);
 CREATE INDEX IF NOT EXISTS idx_trades_signal_outcome_recorded
 ON trades (signal_id, signal_outcome_recorded);
+CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_slot_timestamp
+ON rolling_wr_history (slot_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_signal_id
+ON rolling_wr_history (signal_id);
+CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_batch_id
+ON rolling_wr_history (imported_batch_id);
 """
 
 DEFAULT_SETTINGS = {
@@ -136,6 +182,12 @@ DEFAULT_SETTINGS = {
     "demo_bankroll_usdc": "1000.00",
     "invert_trades_enabled": "false",
     "ml_volatility_gate_enabled": "true",
+    "rolling_wr_enabled": "true",
+    "rolling_wr_window_size": "320",
+    "rolling_wr_follow_below": "49.0",
+    "rolling_wr_invert_above": "51.0",
+    "rolling_wr_min_samples": "320",
+    "rolling_wr_skip_when_unready": "true",
 }
 
 
@@ -208,6 +260,16 @@ async def migrate_db(db_path: str | None = None) -> None:
                 await db.execute("ALTER TABLE trades ADD COLUMN policy_bucket TEXT")
             if "policy_probability" not in columns:
                 await db.execute("ALTER TABLE trades ADD COLUMN policy_probability REAL")
+            if "rolling_wr_policy" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN rolling_wr_policy TEXT")
+            if "rolling_wr_wr" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN rolling_wr_wr REAL")
+            if "rolling_wr_window_size" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN rolling_wr_window_size INTEGER")
+            if "rolling_wr_sample_size" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN rolling_wr_sample_size INTEGER")
+            if "rolling_wr_ready" not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN rolling_wr_ready INTEGER DEFAULT 0")
             if "signal_outcome_recorded" not in columns:
                 await db.execute("ALTER TABLE trades ADD COLUMN signal_outcome_recorded INTEGER DEFAULT 0")
         except Exception as e:
@@ -232,6 +294,22 @@ async def migrate_db(db_path: str | None = None) -> None:
                 await db.execute("ALTER TABLE signals ADD COLUMN threshold_policy_real TEXT")
             if "threshold_policy_demo" not in sig_columns:
                 await db.execute("ALTER TABLE signals ADD COLUMN threshold_policy_demo TEXT")
+            if "rolling_wr_policy" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_policy TEXT")
+            if "rolling_wr_wr" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_wr REAL")
+            if "rolling_wr_window_size" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_window_size INTEGER")
+            if "rolling_wr_sample_size" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_sample_size INTEGER")
+            if "rolling_wr_follow_below" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_follow_below REAL")
+            if "rolling_wr_invert_above" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_invert_above REAL")
+            if "rolling_wr_ready" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_ready INTEGER DEFAULT 0")
+            if "rolling_wr_source" not in sig_columns:
+                await db.execute("ALTER TABLE signals ADD COLUMN rolling_wr_source TEXT")
             if "model_side" not in sig_columns:
                 await db.execute("ALTER TABLE signals ADD COLUMN model_side TEXT")
             if "signal_slug" not in sig_columns:
@@ -290,6 +368,21 @@ async def migrate_db(db_path: str | None = None) -> None:
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trades_signal_outcome_recorded ON trades (signal_id, signal_outcome_recorded)"
+            )
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS rolling_wr_import_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, source_filename TEXT, replace_existing INTEGER NOT NULL DEFAULT 0, row_count INTEGER NOT NULL DEFAULT 0, window_size_hint INTEGER, notes TEXT)"
+            )
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS rolling_wr_history (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, slot_timestamp INTEGER NOT NULL, slot_start TEXT, signal_slug TEXT, original_side TEXT NOT NULL, winner_side TEXT NOT NULL, is_correct INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'live', imported_batch_id INTEGER, imported_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (signal_id) REFERENCES signals(id), FOREIGN KEY (imported_batch_id) REFERENCES rolling_wr_import_batches(id))"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_slot_timestamp ON rolling_wr_history (slot_timestamp DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_signal_id ON rolling_wr_history (signal_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rolling_wr_history_batch_id ON rolling_wr_history (imported_batch_id)"
             )
         except Exception as e:
             log.warning("migrate_db: trades indexes migration failed: %s", e)

@@ -1407,3 +1407,125 @@ def format_drift_alert(drifted_features: list, records_analyzed: int) -> str:
         "\U0001f916 Model may need retraining. Use /retrain to update.",
     ]
     return "\n".join(lines)
+
+
+
+def format_rolling_wr_dashboard(status: dict[str, Any]) -> str:
+    wr = "n/a" if status.get("win_rate") is None else f"{status['win_rate']:.2f}%"
+    policy = status.get("policy", "FOLLOW")
+    ready_text = "READY" if status.get("ready") else "WARMING UP"
+    latest_batch = status.get("latest_batch") or {}
+    source = latest_batch.get("source_filename") or "none"
+    imported_at = latest_batch.get("created_at") or "never"
+    source_mix = status.get("source_mix") or {}
+    return "\n".join([
+        "<b>Rolling WR</b>",
+        "-------------------------",
+        f"Feature: {'ON' if status.get('enabled') else 'OFF'}",
+        f"WR: {wr} over {status.get('sample_size', 0)}/{status.get('window_size', 0)}",
+        f"Policy: {policy} | {ready_text}",
+        f"Thresholds: follow < {status.get('follow_below', 0):.2f}% | invert > {status.get('invert_above', 0):.2f}%",
+        f"Reason: {status.get('reason', 'n/a')}",
+        f"Active window: import {source_mix.get('window_import_count', 0)} | live {source_mix.get('window_live_count', 0)}",
+        f"Last import: {source}",
+        f"Imported at: {imported_at}",
+    ])
+
+
+def format_rolling_wr_settings(config: dict[str, Any], status: dict[str, Any]) -> str:
+    wr = "n/a" if status.get("win_rate") is None else f"{status['win_rate']:.2f}%"
+    return "\n".join([
+        "<b>Rolling WR Settings</b>",
+        "-------------------------",
+        f"Feature: {'ON' if config.get('enabled') else 'OFF'}",
+        f"Window size: {config.get('window_size')}",
+        f"Min samples: {config.get('min_samples')}",
+        f"Follow below: {config.get('follow_below'):.2f}%",
+        f"Invert above: {config.get('invert_above'):.2f}%",
+        f"Warm-up behavior: {'SKIP' if config.get('skip_when_unready') else 'FOLLOW'}",
+        f"Current WR: {wr}",
+        f"Current policy: {status.get('policy')}",
+    ])
+
+
+def format_rolling_wr_analytics(data: dict[str, Any]) -> str:
+    wr = "n/a" if data.get("win_rate") is None else f"{data['win_rate']:.2f}%"
+    policy_distribution = data.get("policy_distribution") or {}
+    recent_signals = data.get("recent_signals") or []
+    recent_lines = []
+    for row in recent_signals[:5]:
+        recent_lines.append(
+            f"{row.get('slot_start', 'n/a')} | {row.get('rolling_wr_policy', 'n/a')} | WR {float(row.get('rolling_wr_wr') or 0):.2f}% | {int(row.get('rolling_wr_sample_size') or 0)} samples"
+        )
+    if not recent_lines:
+        recent_lines.append("No rolling decisions recorded yet.")
+    return "\n".join([
+        "<b>Rolling WR Analytics</b>",
+        "-------------------------",
+        f"Current WR: {wr}",
+        f"Wins/Losses: {data.get('wins', 0)} / {data.get('losses', 0)}",
+        f"Policy now: {data.get('policy')}",
+        f"Ready: {'YES' if data.get('ready') else 'NO'} | Samples: {data.get('sample_size', 0)}/{data.get('min_samples', 0)}",
+        f"Policy mix (recent): F {policy_distribution.get('FOLLOW', 0)} | S {policy_distribution.get('SKIP', 0)} | I {policy_distribution.get('INVERT', 0)}",
+        "Recent rolling decisions:",
+        *recent_lines,
+    ])
+
+
+def format_rolling_wr_history(data: dict[str, Any]) -> str:
+    rows = data.get("recent_history") or []
+    batch = data.get("latest_batch") or {}
+    lines = []
+    for row in rows[:8]:
+        result = "W" if int(row.get("is_correct") or 0) == 1 else "L"
+        lines.append(f"{row.get('slot_start', 'n/a')} | {row.get('source', 'n/a')} | {row.get('original_side', 'n/a')} | {result}")
+    if not lines:
+        lines.append("No rolling history stored yet.")
+    return "\n".join([
+        "<b>Rolling WR History</b>",
+        "-------------------------",
+        f"Last batch: {batch.get('source_filename') or 'none'}",
+        f"Imported rows: {data.get('counts', {}).get('import', 0)}",
+        f"Live rows: {data.get('counts', {}).get('live', 0)}",
+        "Recent rows:",
+        *lines,
+    ])
+
+
+def format_rolling_wr_import_instructions(config: dict[str, Any]) -> str:
+    return (
+        "<b>Rolling WR Warm Start Import</b>\n\n"
+        "Upload the signals Excel file exported from this bot.\n"
+        "Required columns: slot_start, model_side or side, is_win.\n"
+        f"The import will keep only the most recent resolved rows needed for the rolling window ({config.get('window_size')}).\n\n"
+        "Send the .xlsx file now."
+    )
+
+
+def format_rolling_wr_import_preview(preview: dict[str, Any]) -> str:
+    status = preview.get("status") or {}
+    wr = "n/a" if status.get("win_rate") is None else f"{status['win_rate']:.2f}%"
+    return "\n".join([
+        "<b>Rolling WR Import Preview</b>",
+        "-------------------------",
+        f"File: {preview.get('filename', 'uploaded file')}",
+        f"Rows found: {preview.get('rows_found', 0)}",
+        f"Eligible resolved rows: {preview.get('eligible_rows', 0)}",
+        f"Rows rejected: {preview.get('rejected_rows', 0)}",
+        f"Active window after import: {status.get('sample_size', 0)}/{status.get('window_size', 0)}",
+        f"Resulting WR: {wr}",
+        f"Resulting policy: {status.get('policy', 'n/a')}",
+    ])
+
+
+def format_rolling_wr_import_success(result: dict[str, Any]) -> str:
+    status = result.get("status") or {}
+    wr = "n/a" if status.get("win_rate") is None else f"{status['win_rate']:.2f}%"
+    return "\n".join([
+        "<b>Rolling WR Import Applied</b>",
+        "-------------------------",
+        f"Imported rows: {result.get('accepted_rows', 0)}",
+        f"Active window: {status.get('sample_size', 0)}/{status.get('window_size', 0)}",
+        f"WR: {wr}",
+        f"Policy: {status.get('policy', 'n/a')}",
+    ])

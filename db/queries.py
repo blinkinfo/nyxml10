@@ -12,6 +12,7 @@ import config as cfg
 
 VALID_THRESHOLD_POLICIES = {"FOLLOW", "BLOCK", "INVERT"}
 VALID_THRESHOLD_MODES = {"real", "demo"}
+VALID_ROLLING_WR_POLICIES = {"FOLLOW", "SKIP", "INVERT", "WARMUP"}
 
 
 def _db() -> str:
@@ -29,6 +30,13 @@ def normalize_threshold_mode(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in VALID_THRESHOLD_MODES:
         raise ValueError(f"invalid threshold mode: {value}")
+    return normalized
+
+
+def normalize_rolling_wr_policy(value: str | None) -> str:
+    normalized = (value or "FOLLOW").strip().upper()
+    if normalized not in VALID_ROLLING_WR_POLICIES:
+        raise ValueError(f"invalid rolling WR policy: {value}")
     return normalized
 
 
@@ -52,6 +60,32 @@ def invert_side(side: str | None) -> str | None:
     if side == "Down":
         return "Up"
     return side
+
+
+def _parse_bool_setting(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _coerce_int(value: str | None, default: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(float(value)) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, parsed)
+
+
+def _coerce_float(value: str | None, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +211,318 @@ async def is_auto_redeem_enabled() -> bool:
 async def is_invert_trades_enabled() -> bool:
     val = await get_setting("invert_trades_enabled")
     return val == "true"
+
+
+# ---------------------------------------------------------------------------
+# Rolling WR settings and analytics
+# ---------------------------------------------------------------------------
+
+async def get_rolling_wr_config() -> dict[str, Any]:
+    enabled = _parse_bool_setting(await get_setting("rolling_wr_enabled"), True)
+    window_size = _coerce_int(await get_setting("rolling_wr_window_size"), 320, minimum=1)
+    follow_below = _coerce_float(await get_setting("rolling_wr_follow_below"), 49.0)
+    invert_above = _coerce_float(await get_setting("rolling_wr_invert_above"), 51.0)
+    min_samples = _coerce_int(await get_setting("rolling_wr_min_samples"), window_size, minimum=1)
+    skip_when_unready = _parse_bool_setting(await get_setting("rolling_wr_skip_when_unready"), True)
+    if min_samples > window_size:
+        min_samples = window_size
+    return {
+        "enabled": enabled,
+        "window_size": window_size,
+        "follow_below": follow_below,
+        "invert_above": invert_above,
+        "min_samples": min_samples,
+        "skip_when_unready": skip_when_unready,
+    }
+
+
+async def set_rolling_wr_enabled(enabled: bool) -> None:
+    await set_setting("rolling_wr_enabled", "true" if enabled else "false")
+
+
+async def set_rolling_wr_window_size(window_size: int) -> None:
+    window_size = max(1, int(window_size))
+    await set_setting("rolling_wr_window_size", str(window_size))
+    current_min = _coerce_int(await get_setting("rolling_wr_min_samples"), window_size, minimum=1)
+    if current_min > window_size:
+        await set_setting("rolling_wr_min_samples", str(window_size))
+
+
+async def set_rolling_wr_follow_below(value: float) -> None:
+    await set_setting("rolling_wr_follow_below", f"{float(value):.4f}")
+
+
+async def set_rolling_wr_invert_above(value: float) -> None:
+    await set_setting("rolling_wr_invert_above", f"{float(value):.4f}")
+
+
+async def set_rolling_wr_min_samples(value: int) -> None:
+    config = await get_rolling_wr_config()
+    value = max(1, min(int(value), config["window_size"]))
+    await set_setting("rolling_wr_min_samples", str(value))
+
+
+async def set_rolling_wr_skip_when_unready(enabled: bool) -> None:
+    await set_setting("rolling_wr_skip_when_unready", "true" if enabled else "false")
+
+
+async def get_rolling_wr_latest_batch() -> dict[str, Any] | None:
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM rolling_wr_import_batches ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_rolling_wr_history_window(limit: int | None = None) -> list[dict[str, Any]]:
+    config = await get_rolling_wr_config()
+    effective_limit = max(1, int(limit or config["window_size"]))
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM rolling_wr_history ORDER BY slot_timestamp DESC, id DESC LIMIT ?",
+            (effective_limit,),
+        )
+        rows = await cursor.fetchall()
+        ordered = [dict(r) for r in rows]
+    return list(reversed(ordered))
+
+
+async def get_rolling_wr_recent_history(limit: int = 10) -> list[dict[str, Any]]:
+    limit = max(1, int(limit))
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM rolling_wr_history ORDER BY slot_timestamp DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_rolling_wr_history_counts() -> dict[str, int]:
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT source, COUNT(*) AS cnt FROM rolling_wr_history GROUP BY source"
+        )
+        rows = await cursor.fetchall()
+    counts = {"import": 0, "live": 0}
+    for row in rows:
+        source = (row["source"] or "live").lower()
+        if source in counts:
+            counts[source] = int(row["cnt"] or 0)
+    counts["total"] = counts["import"] + counts["live"]
+    return counts
+
+
+async def evaluate_rolling_wr() -> dict[str, Any]:
+    config = await get_rolling_wr_config()
+    window_rows = await get_rolling_wr_history_window(config["window_size"])
+    sample_size = len(window_rows)
+    wins = sum(1 for row in window_rows if int(row.get("is_correct") or 0) == 1)
+    losses = sample_size - wins
+    win_rate = round((wins / sample_size) * 100, 2) if sample_size else None
+    ready = sample_size >= config["min_samples"]
+
+    if not config["enabled"]:
+        policy = "FOLLOW"
+        reason = "rolling WR disabled"
+    elif not ready:
+        policy = "SKIP" if config["skip_when_unready"] else "FOLLOW"
+        reason = "warming up"
+    elif win_rate is not None and win_rate > config["invert_above"]:
+        policy = "INVERT"
+        reason = f"WR {win_rate:.2f}% above {config['invert_above']:.2f}%"
+    elif win_rate is not None and win_rate < config["follow_below"]:
+        policy = "FOLLOW"
+        reason = f"WR {win_rate:.2f}% below {config['follow_below']:.2f}%"
+    else:
+        policy = "SKIP"
+        reason = f"WR {win_rate:.2f}% in neutral zone" if win_rate is not None else "no rolling WR history"
+
+    counts = await get_rolling_wr_history_counts()
+    latest_batch = await get_rolling_wr_latest_batch()
+    source_mix = {
+        "import_count": counts["import"],
+        "live_count": counts["live"],
+        "window_live_count": sum(1 for row in window_rows if (row.get("source") or "live") == "live"),
+        "window_import_count": sum(1 for row in window_rows if (row.get("source") or "live") == "import"),
+    }
+
+    return {
+        "enabled": config["enabled"],
+        "policy": policy,
+        "win_rate": win_rate,
+        "sample_size": sample_size,
+        "window_size": config["window_size"],
+        "min_samples": config["min_samples"],
+        "ready": ready,
+        "wins": wins,
+        "losses": losses,
+        "follow_below": config["follow_below"],
+        "invert_above": config["invert_above"],
+        "skip_when_unready": config["skip_when_unready"],
+        "reason": reason,
+        "window_rows": window_rows,
+        "source_mix": source_mix,
+        "counts": counts,
+        "latest_batch": latest_batch,
+    }
+
+
+async def append_rolling_wr_live_result(
+    *,
+    signal_id: int,
+    slot_timestamp: int,
+    slot_start: str | None,
+    signal_slug: str | None,
+    original_side: str,
+    winner_side: str,
+) -> int | None:
+    if not original_side or not winner_side:
+        return None
+    is_correct = 1 if winner_side == original_side else 0
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        existing = await (
+            await db.execute(
+                "SELECT id FROM rolling_wr_history WHERE signal_id = ? AND source = 'live' LIMIT 1",
+                (signal_id,),
+            )
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cursor = await db.execute(
+            "INSERT INTO rolling_wr_history (signal_id, slot_timestamp, slot_start, signal_slug, original_side, winner_side, is_correct, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'live')",
+            (signal_id, slot_timestamp, slot_start, signal_slug, original_side, winner_side, is_correct),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_signal_by_id(signal_id: int) -> dict[str, Any] | None:
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (
+            await db.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
+        ).fetchone()
+        return dict(row) if row else None
+
+
+async def update_signal_rolling_wr_fields(
+    signal_id: int,
+    status: dict[str, Any],
+) -> None:
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "UPDATE signals SET rolling_wr_policy = ?, rolling_wr_wr = ?, rolling_wr_window_size = ?, rolling_wr_sample_size = ?, rolling_wr_follow_below = ?, rolling_wr_invert_above = ?, rolling_wr_ready = ?, rolling_wr_source = ? WHERE id = ?",
+            (
+                normalize_rolling_wr_policy(status.get("policy")),
+                status.get("win_rate"),
+                status.get("window_size"),
+                status.get("sample_size"),
+                status.get("follow_below"),
+                status.get("invert_above"),
+                1 if status.get("ready") else 0,
+                "live+import",
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
+async def refresh_signal_rolling_wr_snapshot(signal_id: int) -> None:
+    signal = await get_signal_by_id(signal_id)
+    if not signal:
+        return
+    await update_signal_rolling_wr_fields(signal_id, await evaluate_rolling_wr())
+
+
+async def update_trade_rolling_wr_fields(trade_id: int, status: dict[str, Any]) -> None:
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "UPDATE trades SET rolling_wr_policy = ?, rolling_wr_wr = ?, rolling_wr_window_size = ?, rolling_wr_sample_size = ?, rolling_wr_ready = ? WHERE id = ?",
+            (
+                normalize_rolling_wr_policy(status.get("policy")),
+                status.get("win_rate"),
+                status.get("window_size"),
+                status.get("sample_size"),
+                1 if status.get("ready") else 0,
+                trade_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_rolling_wr_analytics() -> dict[str, Any]:
+    status = await evaluate_rolling_wr()
+    recent_history = await get_rolling_wr_recent_history(limit=10)
+    recent_signals: list[dict[str, Any]] = []
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, slot_start, rolling_wr_policy, rolling_wr_wr, rolling_wr_sample_size, rolling_wr_ready, side, model_side FROM signals WHERE skipped = 0 AND rolling_wr_policy IS NOT NULL ORDER BY id DESC LIMIT 10"
+        )
+        rows = await cursor.fetchall()
+        recent_signals = [dict(r) for r in rows]
+
+    policy_distribution = {"FOLLOW": 0, "SKIP": 0, "INVERT": 0, "WARMUP": 0}
+    for row in recent_signals:
+        policy = normalize_rolling_wr_policy(row.get("rolling_wr_policy"))
+        policy_distribution[policy] = policy_distribution.get(policy, 0) + 1
+
+    return {
+        **status,
+        "recent_history": recent_history,
+        "recent_signals": recent_signals,
+        "policy_distribution": policy_distribution,
+    }
+
+
+async def replace_rolling_wr_import(
+    *,
+    filename: str | None,
+    rows: list[dict[str, Any]],
+    window_size_hint: int,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    accepted = len(rows)
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            "INSERT INTO rolling_wr_import_batches (source_filename, replace_existing, row_count, window_size_hint, notes) VALUES (?, 1, ?, ?, ?)",
+            (filename, accepted, window_size_hint, notes),
+        )
+        batch_id = cursor.lastrowid
+        await db.execute("DELETE FROM rolling_wr_history WHERE source = 'import'")
+        for row in rows:
+            await db.execute(
+                "INSERT INTO rolling_wr_history (signal_id, slot_timestamp, slot_start, signal_slug, original_side, winner_side, is_correct, source, imported_batch_id, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'import', ?, ?)",
+                (
+                    None,
+                    int(row["slot_timestamp"]),
+                    row.get("slot_start"),
+                    row.get("signal_slug"),
+                    row["original_side"],
+                    row["winner_side"],
+                    int(row["is_correct"]),
+                    batch_id,
+                    timestamp,
+                ),
+            )
+        await db.commit()
+    await set_setting("rolling_wr_last_imported_at", timestamp)
+    await set_setting("rolling_wr_last_import_count", str(accepted))
+    await set_setting("rolling_wr_import_source", filename or "uploaded file")
+    status = await evaluate_rolling_wr()
+    return {
+        "batch_id": batch_id,
+        "accepted_rows": accepted,
+        "status": status,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +665,19 @@ async def insert_signal(
     threshold_policy_demo: str | None = None,
     model_side: str | None = None,
     signal_slug: str | None = None,
+    rolling_wr_policy: str | None = None,
+    rolling_wr_wr: float | None = None,
+    rolling_wr_window_size: int | None = None,
+    rolling_wr_sample_size: int | None = None,
+    rolling_wr_follow_below: float | None = None,
+    rolling_wr_invert_above: float | None = None,
+    rolling_wr_ready: bool | None = None,
+    rolling_wr_source: str | None = None,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, entry_price, opposite_price, skipped, filter_blocked, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo, model_side, signal_slug) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO signals (slot_start, slot_end, slot_timestamp, side, entry_price, opposite_price, skipped, filter_blocked, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo, rolling_wr_policy, rolling_wr_wr, rolling_wr_window_size, rolling_wr_sample_size, rolling_wr_follow_below, rolling_wr_invert_above, rolling_wr_ready, rolling_wr_source, model_side, signal_slug) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 slot_start,
                 slot_end,
@@ -340,6 +694,14 @@ async def insert_signal(
                 ml_probability_used,
                 normalize_threshold_policy(threshold_policy_real) if threshold_policy_real else None,
                 normalize_threshold_policy(threshold_policy_demo) if threshold_policy_demo else None,
+                normalize_rolling_wr_policy(rolling_wr_policy) if rolling_wr_policy else None,
+                rolling_wr_wr,
+                rolling_wr_window_size,
+                rolling_wr_sample_size,
+                rolling_wr_follow_below,
+                rolling_wr_invert_above,
+                1 if rolling_wr_ready else 0 if rolling_wr_ready is not None else None,
+                rolling_wr_source,
                 model_side,
                 signal_slug,
             ),
@@ -418,11 +780,16 @@ async def insert_trade(
     routed_side: str | None = None,
     policy_bucket: str | None = None,
     policy_probability: float | None = None,
+    rolling_wr_policy: str | None = None,
+    rolling_wr_wr: float | None = None,
+    rolling_wr_window_size: int | None = None,
+    rolling_wr_sample_size: int | None = None,
+    rolling_wr_ready: bool | None = None,
 ) -> int:
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO trades (signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, is_demo, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, is_demo, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability, rolling_wr_policy, rolling_wr_wr, rolling_wr_window_size, rolling_wr_sample_size, rolling_wr_ready) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal_id,
                 slot_start,
@@ -440,6 +807,11 @@ async def insert_trade(
                 routed_side or side,
                 truncate_probability_bucket(policy_bucket),
                 policy_probability,
+                normalize_rolling_wr_policy(rolling_wr_policy) if rolling_wr_policy else None,
+                rolling_wr_wr,
+                rolling_wr_window_size,
+                rolling_wr_sample_size,
+                1 if rolling_wr_ready else 0 if rolling_wr_ready is not None else None,
             ),
         )
         await db.commit()
@@ -772,7 +1144,7 @@ async def get_all_real_trades_for_export() -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, retry_count, outcome, is_win, pnl, resolved_at, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability FROM trades WHERE is_demo = 0 ORDER BY id ASC"
+            "SELECT id, signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, retry_count, outcome, is_win, pnl, resolved_at, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability, rolling_wr_policy, rolling_wr_wr, rolling_wr_window_size, rolling_wr_sample_size, rolling_wr_ready FROM trades WHERE is_demo = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -782,7 +1154,7 @@ async def get_all_demo_trades_for_export() -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, retry_count, outcome, is_win, pnl, resolved_at, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability FROM trades WHERE is_demo = 1 ORDER BY id ASC"
+            "SELECT id, signal_id, slot_start, slot_end, side, entry_price, amount_usdc, order_id, fill_price, status, retry_count, outcome, is_win, pnl, resolved_at, routing_mode, routing_policy, original_side, routed_side, policy_bucket, policy_probability, rolling_wr_policy, rolling_wr_wr, rolling_wr_window_size, rolling_wr_sample_size, rolling_wr_ready FROM trades WHERE is_demo = 1 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -792,7 +1164,7 @@ async def get_all_signals_for_export() -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, slot_start, side, model_side, entry_price, is_win, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo FROM signals WHERE skipped = 0 ORDER BY id ASC"
+            "SELECT id, slot_start, slot_timestamp, side, model_side, entry_price, is_win, pattern, ml_p_up, ml_p_down, ml_probability_bucket, ml_probability_used, threshold_policy_real, threshold_policy_demo, rolling_wr_policy, rolling_wr_wr, rolling_wr_window_size, rolling_wr_sample_size, rolling_wr_follow_below, rolling_wr_invert_above, rolling_wr_ready FROM signals WHERE skipped = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
