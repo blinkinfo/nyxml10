@@ -416,7 +416,8 @@ async def _check_and_trade() -> None:
         legacy_blocked_ranges = await queries.get_blocked_threshold_ranges()
 
         real_route = await queries.decide_threshold_route(
-            original_side=rolling_side or model_side,
+            original_side=model_side,
+            effective_side=rolling_side,
             probability=routing_probability,
             bucket=routing_bucket,
             mode="real",
@@ -424,7 +425,8 @@ async def _check_and_trade() -> None:
             legacy_blocked_ranges=legacy_blocked_ranges,
         )
         demo_route = await queries.decide_threshold_route(
-            original_side=rolling_side or model_side,
+            original_side=model_side,
+            effective_side=rolling_side,
             probability=routing_probability,
             bucket=routing_bucket,
             mode="demo",

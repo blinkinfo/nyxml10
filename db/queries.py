@@ -605,6 +605,7 @@ async def get_threshold_policy_matrix(mode: str | None = None) -> dict[str, dict
 async def decide_threshold_route(
     *,
     original_side: str,
+    effective_side: str | None = None,
     probability: float | None,
     bucket: str | None,
     mode: str,
@@ -615,6 +616,7 @@ async def decide_threshold_route(
     normalized_bucket = truncate_probability_bucket(bucket or probability)
     policy = await get_threshold_policy(normalized_bucket, normalized_mode)
     reasons: list[str] = []
+    base_side = effective_side or original_side
 
     if policy == "FOLLOW":
         if legacy_invert_enabled and normalized_mode == "real":
@@ -627,9 +629,9 @@ async def decide_threshold_route(
                     reasons.append(f"legacy blocked threshold range [{lo:.2f}, {hi:.2f}] applied as fallback")
                     break
 
-    routed_side = None if policy == "BLOCK" else original_side
+    routed_side = None if policy == "BLOCK" else base_side
     if policy == "INVERT":
-        routed_side = invert_side(original_side)
+        routed_side = invert_side(base_side)
 
     return {
         "mode": normalized_mode,
@@ -637,6 +639,7 @@ async def decide_threshold_route(
         "bucket": normalized_bucket,
         "probability": probability,
         "original_side": original_side,
+        "effective_side": base_side,
         "routed_side": routed_side,
         "blocked": policy == "BLOCK",
         "reason": "; ".join(reasons) if reasons else None,

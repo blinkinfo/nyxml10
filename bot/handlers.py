@@ -830,6 +830,93 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "cancel_disable_ml_volatility_gate":
         await query.answer("ML volatility gate kept ON")
         await cmd_settings(update, context)
+    elif data == "rolling_wr_settings":
+        await _render_rolling_wr_settings(update)
+    elif data == "rolling_wr_analytics":
+        await _render_rolling_wr_analytics(update)
+    elif data == "rolling_wr_history":
+        await _render_rolling_wr_history(update)
+    elif data == "rolling_wr_import":
+        context.user_data["awaiting_rolling_wr_import"] = True
+        context.user_data.pop("rolling_wr_import_preview", None)
+        await query.answer()
+        await _safe_edit(query, format_rolling_wr_import_instructions(), reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_toggle":
+        config = await queries.get_rolling_wr_config()
+        await queries.set_rolling_wr_enabled(not config["enabled"])
+        await query.answer(f"Rolling WR {'ON' if not config['enabled'] else 'OFF'}")
+        await _render_rolling_wr_settings(update)
+    elif data == "rolling_wr_toggle_skip_unready":
+        config = await queries.get_rolling_wr_config()
+        await queries.set_rolling_wr_skip_when_unready(not config["skip_when_unready"])
+        await query.answer(f"Warm-up mode {'SKIP' if not config['skip_when_unready'] else 'FOLLOW'}")
+        await _render_rolling_wr_settings(update)
+    elif data == "rolling_wr_reset_defaults":
+        await queries.set_rolling_wr_enabled(True)
+        await queries.set_rolling_wr_window_size(320)
+        await queries.set_rolling_wr_min_samples(320)
+        await queries.set_rolling_wr_follow_below(49.0)
+        await queries.set_rolling_wr_invert_above(51.0)
+        await queries.set_rolling_wr_skip_when_unready(True)
+        context.user_data.pop("awaiting_rolling_wr_window", None)
+        context.user_data.pop("awaiting_rolling_wr_min_samples", None)
+        context.user_data.pop("awaiting_rolling_wr_follow_below", None)
+        context.user_data.pop("awaiting_rolling_wr_invert_above", None)
+        await query.answer("Rolling WR defaults restored")
+        await _render_rolling_wr_settings(update)
+    elif data == "rolling_wr_set_window":
+        context.user_data["awaiting_rolling_wr_window"] = True
+        context.user_data.pop("awaiting_rolling_wr_min_samples", None)
+        context.user_data.pop("awaiting_rolling_wr_follow_below", None)
+        context.user_data.pop("awaiting_rolling_wr_invert_above", None)
+        config = await queries.get_rolling_wr_config()
+        await query.answer()
+        await _safe_edit(query, f"<b>Set Rolling WR Window</b>\n\nCurrent: <b>{config['window_size']}</b>\n\nSend a whole number for the rolling window size.", reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_set_min_samples":
+        context.user_data["awaiting_rolling_wr_min_samples"] = True
+        context.user_data.pop("awaiting_rolling_wr_window", None)
+        context.user_data.pop("awaiting_rolling_wr_follow_below", None)
+        context.user_data.pop("awaiting_rolling_wr_invert_above", None)
+        config = await queries.get_rolling_wr_config()
+        await query.answer()
+        await _safe_edit(query, f"<b>Set Rolling WR Min Samples</b>\n\nCurrent: <b>{config['min_samples']}</b>\nWindow: <b>{config['window_size']}</b>\n\nSend a whole number up to the window size.", reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_set_follow_below":
+        context.user_data["awaiting_rolling_wr_follow_below"] = True
+        context.user_data.pop("awaiting_rolling_wr_window", None)
+        context.user_data.pop("awaiting_rolling_wr_min_samples", None)
+        context.user_data.pop("awaiting_rolling_wr_invert_above", None)
+        config = await queries.get_rolling_wr_config()
+        await query.answer()
+        await _safe_edit(query, f"<b>Set Follow-Below Threshold</b>\n\nCurrent: <b>{config['follow_below']:.2f}%</b>\n\nSend a percentage between 0 and 100.", reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_set_invert_above":
+        context.user_data["awaiting_rolling_wr_invert_above"] = True
+        context.user_data.pop("awaiting_rolling_wr_window", None)
+        context.user_data.pop("awaiting_rolling_wr_min_samples", None)
+        context.user_data.pop("awaiting_rolling_wr_follow_below", None)
+        config = await queries.get_rolling_wr_config()
+        await query.answer()
+        await _safe_edit(query, f"<b>Set Invert-Above Threshold</b>\n\nCurrent: <b>{config['invert_above']:.2f}%</b>\n\nSend a percentage between 0 and 100.", reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_import_confirm":
+        preview = context.user_data.get("rolling_wr_import_preview")
+        if not preview:
+            await query.answer("No import preview found", show_alert=True)
+            await _render_rolling_wr_hub(update)
+        else:
+            result = await queries.replace_rolling_wr_import(
+                filename=preview.get("filename"),
+                rows=preview.get("rows") or [],
+                window_size_hint=(preview.get("status") or {}).get("window_size") or len(preview.get("rows") or []),
+                notes=f"Imported from Telegram upload: {preview.get('filename') or 'signals.xlsx'}",
+            )
+            context.user_data.pop("rolling_wr_import_preview", None)
+            context.user_data["awaiting_rolling_wr_import"] = False
+            await query.answer("Rolling WR import applied")
+            await _safe_edit(query, format_rolling_wr_import_success(preview, result), reply_markup=rolling_wr_back_keyboard())
+    elif data == "rolling_wr_import_cancel":
+        context.user_data.pop("rolling_wr_import_preview", None)
+        context.user_data["awaiting_rolling_wr_import"] = False
+        await query.answer("Import cancelled")
+        await _render_rolling_wr_hub(update)
     elif data == "cmd_demo":
         await _render_demo_stats(update, active="all")
     elif data == "demo_10":
@@ -971,6 +1058,74 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pct = round(pct, 2)
         await queries.set_setting("trade_pct", str(pct))
         await update.message.reply_text(f"\u2705 Trade percentage set to <b>{pct:.2f}%</b>", parse_mode="HTML")
+        return
+
+    if context.user_data.get("awaiting_rolling_wr_window"):
+        context.user_data["awaiting_rolling_wr_window"] = False
+        try:
+            window_size = _parse_positive_int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ Invalid window size. Send a whole number greater than 0.", parse_mode="HTML")
+            context.user_data["awaiting_rolling_wr_window"] = True
+            return
+        await queries.set_rolling_wr_window_size(window_size)
+        config = await queries.get_rolling_wr_config()
+        await update.message.reply_text(
+            f"✅ Rolling WR window set to <b>{config['window_size']}</b>. Min samples is now <b>{config['min_samples']}</b>.",
+            parse_mode="HTML",
+            reply_markup=rolling_wr_settings_keyboard(config['enabled'], config['skip_when_unready']),
+        )
+        return
+
+    if context.user_data.get("awaiting_rolling_wr_min_samples"):
+        context.user_data["awaiting_rolling_wr_min_samples"] = False
+        try:
+            min_samples = _parse_positive_int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ Invalid min samples. Send a whole number greater than 0.", parse_mode="HTML")
+            context.user_data["awaiting_rolling_wr_min_samples"] = True
+            return
+        await queries.set_rolling_wr_min_samples(min_samples)
+        config = await queries.get_rolling_wr_config()
+        await update.message.reply_text(
+            f"✅ Rolling WR min samples set to <b>{config['min_samples']}</b>.",
+            parse_mode="HTML",
+            reply_markup=rolling_wr_settings_keyboard(config['enabled'], config['skip_when_unready']),
+        )
+        return
+
+    if context.user_data.get("awaiting_rolling_wr_follow_below"):
+        context.user_data["awaiting_rolling_wr_follow_below"] = False
+        try:
+            value = _parse_rolling_wr_percent(update.message.text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage. Send a value from 0 to 100.", parse_mode="HTML")
+            context.user_data["awaiting_rolling_wr_follow_below"] = True
+            return
+        await queries.set_rolling_wr_follow_below(value)
+        config = await queries.get_rolling_wr_config()
+        await update.message.reply_text(
+            f"✅ Follow-below threshold set to <b>{config['follow_below']:.2f}%</b>.",
+            parse_mode="HTML",
+            reply_markup=rolling_wr_settings_keyboard(config['enabled'], config['skip_when_unready']),
+        )
+        return
+
+    if context.user_data.get("awaiting_rolling_wr_invert_above"):
+        context.user_data["awaiting_rolling_wr_invert_above"] = False
+        try:
+            value = _parse_rolling_wr_percent(update.message.text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage. Send a value from 0 to 100.", parse_mode="HTML")
+            context.user_data["awaiting_rolling_wr_invert_above"] = True
+            return
+        await queries.set_rolling_wr_invert_above(value)
+        config = await queries.get_rolling_wr_config()
+        await update.message.reply_text(
+            f"✅ Invert-above threshold set to <b>{config['invert_above']:.2f}%</b>.",
+            parse_mode="HTML",
+            reply_markup=rolling_wr_settings_keyboard(config['enabled'], config['skip_when_unready']),
+        )
         return
 
     if context.user_data.get("awaiting_demo_bankroll"):
