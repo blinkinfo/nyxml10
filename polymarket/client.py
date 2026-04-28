@@ -25,7 +25,7 @@ class PolymarketClient:
         self.client = ClobClient(
             host=config.CLOB_HOST,
             key=config.POLYMARKET_PRIVATE_KEY,
-            chain=config.CHAIN_ID,
+            chain_id=config.CHAIN_ID,
             signature_type=config.POLYMARKET_SIGNATURE_TYPE,
             funder=config.POLYMARKET_FUNDER_ADDRESS,
         )
@@ -38,7 +38,7 @@ class PolymarketClient:
         self.client = ClobClient(
             host=config.CLOB_HOST,
             key=config.POLYMARKET_PRIVATE_KEY,
-            chain=config.CHAIN_ID,
+            chain_id=config.CHAIN_ID,
             signature_type=config.POLYMARKET_SIGNATURE_TYPE,
             funder=config.POLYMARKET_FUNDER_ADDRESS,
             creds=ApiCreds(
