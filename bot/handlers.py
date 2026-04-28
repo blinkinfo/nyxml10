@@ -934,6 +934,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_edit(query, "\U0001f916 <b>ML Model</b>", reply_markup=ml_menu())
     elif data == "cmd_thresholds":
         await cmd_thresholds(update, context)
+    elif data == "cmd_rolling_wr":
+        await cmd_rolling_wr(update, context)
     elif data == "thresholds_real" or (data.startswith("thresholds_real_p") and data[len("thresholds_real_p"):].isdigit()):
         page = int(data[len("thresholds_real_p"):]) if "_p" in data else 1
         await _render_threshold_policies(update, "real", page=page)
