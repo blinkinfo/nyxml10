@@ -770,17 +770,42 @@ def _redeem_via_safe(
     safe_exec_success = False
     safe_exec_failure = False
     try:
-        success_events = safe.events.ExecutionSuccess().process_receipt(receipt)
-        failure_events = safe.events.ExecutionFailure().process_receipt(receipt)
-        safe_exec_success = any(
-            event.get("args", {}).get("txHash") == safe_tx_hash for event in success_events
-        )
-        safe_exec_failure = any(
-            event.get("args", {}).get("txHash") == safe_tx_hash for event in failure_events
-        )
+        from eth_utils import event_abi_to_log_topic  # type: ignore
+
+        success_topic = event_abi_to_log_topic(_SAFE_ABI[3])
+        failure_topic = event_abi_to_log_topic(_SAFE_ABI[4])
+        def _norm_hex(value):
+            hex_value = value.hex() if hasattr(value, "hex") else str(value)
+            hex_value = hex_value.lower()
+            return hex_value if hex_value.startswith("0x") else f"0x{hex_value}"
+
+        expected_hash = _norm_hex(safe_tx_hash)
+        success_topic_hex = _norm_hex(success_topic)
+        failure_topic_hex = _norm_hex(failure_topic)
+
+        for log_entry in receipt.get("logs", []) or []:
+            topics = log_entry.get("topics") or []
+            if not topics:
+                continue
+            topic0_hex = _norm_hex(topics[0])
+            if topic0_hex not in {success_topic_hex, failure_topic_hex}:
+                continue
+            if len(topics) < 2:
+                continue
+            tx_topic_hex = _norm_hex(topics[1])
+            if tx_topic_hex != expected_hash:
+                continue
+            emitter = log_entry.get("address")
+            emitter = emitter.lower() if isinstance(emitter, str) else emitter
+            if emitter != safe_address.lower():
+                continue
+            if topic0_hex == success_topic_hex:
+                safe_exec_success = True
+            elif topic0_hex == failure_topic_hex:
+                safe_exec_failure = True
     except Exception as exc:
         log.warning(
-            "Could not decode Safe execution events for tx=%s condition=%s: %s",
+            "Could not inspect Safe execution logs for tx=%s condition=%s: %s",
             tx_hash_hex, condition_id_hex, exc,
         )
 
