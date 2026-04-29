@@ -131,7 +131,8 @@ def test_verify_zero_balance_ignores_unrelated_candidate_index_sets():
     assert verification["all_zero"] is True
 
 
-def test_safe_exec_requires_execution_success_event(monkeypatch):
+def test_safe_exec_execution_failure_event_returns_failure(monkeypatch):
+    """ExecutionFailure log → success=False even though outer tx status=1."""
     class _CallValue:
         def __init__(self, value):
             self._value = value
@@ -146,22 +147,16 @@ def test_safe_exec_requires_execution_success_event(monkeypatch):
         def build_transaction(self, tx):
             return tx
 
-    class _EventProxy:
-        def __init__(self, logs):
-            self._logs = logs
-
-        def __call__(self):
-            return self
-
-        def process_receipt(self, receipt):
-            return self._logs
+    safe_tx_hash = b"\x12" * 32
+    success_topic = b"\xaa" * 32
+    failure_topic = b"\xbb" * 32
 
     class _SafeFunctions:
         def nonce(self):
             return _CallValue(7)
 
         def getTransactionHash(self, *args):
-            return _CallValue(b"\x12" * 32)
+            return _CallValue(safe_tx_hash)
 
         def execTransaction(self, *args):
             return _TxBuilder()
@@ -169,14 +164,7 @@ def test_safe_exec_requires_execution_success_event(monkeypatch):
     class _SafeContract:
         def __init__(self):
             self.functions = _SafeFunctions()
-            self.events = type(
-                "Events",
-                (),
-                {
-                    "ExecutionSuccess": lambda self=None: _EventProxy([]),
-                    "ExecutionFailure": lambda self=None: _EventProxy([]),
-                },
-            )()
+            self.events = type("Events", (), {})()
 
     class _Eth:
         gas_price = 1
@@ -201,7 +189,18 @@ def test_safe_exec_requires_execution_success_event(monkeypatch):
             return type("TxHash", (), {"hex": lambda self: "0xabc"})()
 
         def wait_for_transaction_receipt(self, tx_hash, timeout=120):
-            return {"status": 1, "gasUsed": 12345}
+            # Outer tx succeeded (status=1) but Safe emits ExecutionFailure
+            return {
+                "status": 1,
+                "gasUsed": 12345,
+                "blockNumber": 100,
+                "logs": [
+                    {
+                        "address": "0x0000000000000000000000000000000000000001",
+                        "topics": [failure_topic, safe_tx_hash],
+                    }
+                ],
+            }
 
     class _Web3:
         def __init__(self):
@@ -214,6 +213,11 @@ def test_safe_exec_requires_execution_success_event(monkeypatch):
         sys.modules,
         "web3",
         types.SimpleNamespace(Web3=types.SimpleNamespace(to_checksum_address=staticmethod(lambda value: value))),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "eth_utils",
+        types.SimpleNamespace(event_abi_to_log_topic=lambda abi: success_topic if abi["name"] == "ExecutionSuccess" else failure_topic),
     )
 
     result = redeemer._redeem_via_safe(
@@ -231,8 +235,10 @@ def test_safe_exec_requires_execution_success_event(monkeypatch):
     )
 
     assert result["success"] is False
-    assert result["error"] == "Safe execution success could not be confirmed"
+    assert "ExecutionFailure" in result["error"]
     assert result["verified"] is False
+    assert result["verification"]["safe_exec_failure"] is True
+    assert result["verification"]["safe_exec_success"] is False
 
 
 def test_safe_exec_log_scan_detects_success_without_abi_decoding(monkeypatch):
@@ -295,6 +301,7 @@ def test_safe_exec_log_scan_detects_success_without_abi_decoding(monkeypatch):
             return {
                 "status": 1,
                 "gasUsed": 12345,
+                "blockNumber": 100,
                 "logs": [
                     {
                         "address": "0x0000000000000000000000000000000000000001",
@@ -341,7 +348,10 @@ def test_safe_exec_log_scan_detects_success_without_abi_decoding(monkeypatch):
     assert result["verification"]["safe_exec_failure"] is False
 
 
-def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
+def test_safe_exec_receipt_status_fallback_when_logs_unavailable(monkeypatch):
+    """When eth_utils is unavailable and logs are empty, fall back to receipt
+    status=1 and treat the redemption as succeeded (confirmed_by='receipt_status').
+    This is the real-world scenario that was causing GS026 failures previously."""
     class _CallValue:
         def __init__(self, value):
             self._value = value
@@ -349,18 +359,12 @@ def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
         def call(self):
             return self._value
 
-    class _ExecTxBuilder:
-        def __init__(self, call_result=True):
-            self._call_result = call_result
-
+    class _TxBuilder:
         def estimate_gas(self, tx):
             return 150000
 
         def build_transaction(self, tx):
             return tx
-
-        def call(self, tx=None, block_identifier=None):
-            return self._call_result
 
     safe_tx_hash = b"4" * 32
 
@@ -372,7 +376,7 @@ def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
             return _CallValue(safe_tx_hash)
 
         def execTransaction(self, *args):
-            return _ExecTxBuilder(call_result=True)
+            return _TxBuilder()
 
     class _SafeContract:
         def __init__(self):
@@ -402,6 +406,7 @@ def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
             return type("TxHash", (), {"hex": lambda self: "0xdef"})()
 
         def wait_for_transaction_receipt(self, tx_hash, timeout=120):
+            # status=1, empty logs, no eth_utils → must fall back to receipt_status
             return {"status": 1, "gasUsed": 12345, "blockNumber": 999, "logs": []}
 
     class _Web3:
@@ -416,6 +421,8 @@ def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
         "web3",
         types.SimpleNamespace(Web3=types.SimpleNamespace(to_checksum_address=staticmethod(lambda value: value))),
     )
+    # Simulate eth_utils being unavailable — remove it from sys.modules
+    monkeypatch.delitem(sys.modules, "eth_utils", raising=False)
 
     result = redeemer._redeem_via_safe(
         w3=_Web3(),
@@ -434,7 +441,7 @@ def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
     assert result["success"] is True
     assert result["verified"] is True
     assert result["verification"]["safe_exec_success"] is True
-    assert result["verification"]["safe_exec_confirmed_by"] == "call_replay"
+    assert result["verification"]["safe_exec_confirmed_by"] == "receipt_status"
 
 
 def test_redemption_duplicate_prevention_blocks_pending_and_completed_attempts():

@@ -767,6 +767,26 @@ def _redeem_via_safe(
         tx_hash_hex, gas_used, condition_id_hex,
     )
 
+    # -----------------------------------------------------------------------
+    # Confirm whether the Safe's inner call succeeded.
+    #
+    # Gnosis Safe execTransaction behaviour:
+    #   - The OUTER tx (the one we broadcast) only reverts if the Safe itself
+    #     hits a hard error (bad signatures, re-entrancy guard, etc.).
+    #   - receipt["status"] == 1 means the outer tx succeeded.
+    #   - The INNER call (our redeemPositions) may still fail; in that case
+    #     the Safe emits ExecutionFailure and returns false — but the outer
+    #     tx does NOT revert.
+    #
+    # Confirmation priority:
+    #   1. Inspect receipt logs for ExecutionSuccess / ExecutionFailure topic.
+    #   2. If logs cannot be decoded (provider strips them, eth_utils missing,
+    #      etc.) fall back to trusting receipt["status"] == 1 with a warning.
+    #
+    # NOTE: replaying execTransaction via eth_call AFTER the tx is mined will
+    # always fail with GS026 ("Invalid owner provided") because the Safe nonce
+    # has already incremented.  Never do that.
+    # -----------------------------------------------------------------------
     safe_exec_success = False
     safe_exec_failure = False
     safe_exec_confirmed_by = None
@@ -776,77 +796,64 @@ def _redeem_via_safe(
         hex_value = hex_value.lower()
         return hex_value if hex_value.startswith("0x") else f"0x{hex_value}"
 
-    # First prefer the canonical execTransaction return value if the provider supports eth_call replay.
     try:
-        call_result = safe.functions.execTransaction(
-            to,
-            value,
-            data,
-            operation,
-            safe_tx_gas,
-            base_gas,
-            gas_price_safe,
-            gas_token,
-            refund_receiver,
-            signatures,
-        ).call({"from": eoa_account}, block_identifier=receipt.get("blockNumber"))
-        safe_exec_success = bool(call_result)
-        if safe_exec_success:
-            safe_exec_confirmed_by = "call_replay"
+        from eth_utils import event_abi_to_log_topic  # type: ignore
+
+        success_topic_hex = _norm_hex(event_abi_to_log_topic(_SAFE_ABI[3]))
+        failure_topic_hex = _norm_hex(event_abi_to_log_topic(_SAFE_ABI[4]))
+        expected_hash     = _norm_hex(safe_tx_hash)
+
+        for log_entry in receipt.get("logs", []) or []:
+            topics = log_entry.get("topics") or []
+            if not topics:
+                continue
+            topic0_hex = _norm_hex(topics[0])
+            if topic0_hex not in {success_topic_hex, failure_topic_hex}:
+                continue
+            # Verify the log was emitted by our Safe, not some other contract.
+            emitter = log_entry.get("address") or ""
+            if emitter.lower() != safe_address.lower():
+                continue
+            # txHash is the first indexed param → topics[1]
+            if len(topics) < 2 or _norm_hex(topics[1]) != expected_hash:
+                continue
+            if topic0_hex == success_topic_hex:
+                safe_exec_success = True
+                safe_exec_confirmed_by = "receipt_log"
+            else:
+                safe_exec_failure = True
+                safe_exec_confirmed_by = "receipt_log"
+            break
+
+        if not safe_exec_success and not safe_exec_failure:
+            # Logs were parseable but no matching Safe event found.
+            # This can happen if the provider returns abbreviated logs.
+            # receipt["status"] == 1 is our fallback — the outer tx succeeded
+            # so we conservatively treat the inner call as succeeded too and
+            # let the post-tx balance check be the real verification.
+            log.warning(
+                "Safe ExecutionSuccess/Failure log not found in receipt for "
+                "tx=%s condition=%s — trusting receipt status=1",
+                tx_hash_hex, condition_id_hex,
+            )
+            safe_exec_success = True
+            safe_exec_confirmed_by = "receipt_status"
+
     except Exception as exc:
-        log.info(
-            "Safe execTransaction call replay unavailable for tx=%s condition=%s: %s",
+        # eth_utils unavailable or some other parse error — fall back to status.
+        log.warning(
+            "Could not inspect Safe execution logs for tx=%s condition=%s: %s"
+            " — trusting receipt status=1",
             tx_hash_hex, condition_id_hex, exc,
         )
+        safe_exec_success = True
+        safe_exec_confirmed_by = "receipt_status"
 
-    # Fall back to receipt log inspection.
-    if not safe_exec_success:
-        try:
-            from eth_utils import event_abi_to_log_topic  # type: ignore
-
-            success_topic = event_abi_to_log_topic(_SAFE_ABI[3])
-            failure_topic = event_abi_to_log_topic(_SAFE_ABI[4])
-            expected_hash = _norm_hex(safe_tx_hash)
-            success_topic_hex = _norm_hex(success_topic)
-            failure_topic_hex = _norm_hex(failure_topic)
-
-            for log_entry in receipt.get("logs", []) or []:
-                topics = log_entry.get("topics") or []
-                if not topics:
-                    continue
-                topic0_hex = _norm_hex(topics[0])
-                if topic0_hex not in {success_topic_hex, failure_topic_hex}:
-                    continue
-                emitter = log_entry.get("address")
-                emitter = emitter.lower() if isinstance(emitter, str) else emitter
-                if emitter != safe_address.lower():
-                    continue
-                indexed_topics = [_norm_hex(topic) for topic in topics[1:]]
-                if expected_hash not in indexed_topics:
-                    continue
-                if topic0_hex == success_topic_hex:
-                    safe_exec_success = True
-                    safe_exec_confirmed_by = "receipt_log"
-                elif topic0_hex == failure_topic_hex:
-                    safe_exec_failure = True
-                    safe_exec_confirmed_by = "receipt_log"
-        except Exception as exc:
-            log.warning(
-                "Could not inspect Safe execution logs for tx=%s condition=%s: %s",
-                tx_hash_hex, condition_id_hex, exc,
-            )
-
-    if safe_exec_failure or not safe_exec_success:
-        error_msg = (
-            "Safe inner redeem call failed"
-            if safe_exec_failure
-            else "Safe execution success could not be confirmed"
-        )
+    if safe_exec_failure:
+        error_msg = "Safe inner redeem call failed (ExecutionFailure event)"
         log.error(
             "%s: tx=%s condition=%s safe_tx_hash=%s",
-            error_msg,
-            tx_hash_hex,
-            condition_id_hex,
+            error_msg, tx_hash_hex, condition_id_hex,
             safe_tx_hash.hex() if hasattr(safe_tx_hash, "hex") else safe_tx_hash,
         )
         return {
@@ -861,8 +868,8 @@ def _redeem_via_safe(
                 "verified": False,
                 "all_zero": False,
                 "checked_positions": [],
-                "safe_exec_success": safe_exec_success,
-                "safe_exec_failure": safe_exec_failure,
+                "safe_exec_success": False,
+                "safe_exec_failure": True,
                 "safe_exec_confirmed_by": safe_exec_confirmed_by,
             },
         }
