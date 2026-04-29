@@ -148,6 +148,18 @@ _SAFE_ABI = [
         "outputs": [{"name": "success", "type": "bool"}],
     },
     {
+        "name": "ExecutionSuccess",
+        "type": "event",
+        "anonymous": False,
+        "inputs": [{"indexed": True, "name": "txHash", "type": "bytes32"}, {"indexed": False, "name": "payment", "type": "uint256"}],
+    },
+    {
+        "name": "ExecutionFailure",
+        "type": "event",
+        "anonymous": False,
+        "inputs": [{"indexed": True, "name": "txHash", "type": "bytes32"}, {"indexed": False, "name": "payment", "type": "uint256"}],
+    },
+    {
         "name": "getOwners",
         "type": "function",
         "stateMutability": "view",
@@ -512,6 +524,7 @@ def _redeem_position_sync(
                 cid_bytes=cid_bytes,
                 index_sets=index_sets,
                 condition_id_hex=condition_id_hex,
+                positions=positions,
             )
 
         # ===================================================================
@@ -623,6 +636,7 @@ def _redeem_via_safe(
     cid_bytes: bytes,
     index_sets: list,
     condition_id_hex: str,
+    positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute redeemPositions() through the Gnosis Safe via execTransaction.
 
@@ -753,6 +767,53 @@ def _redeem_via_safe(
         tx_hash_hex, gas_used, condition_id_hex,
     )
 
+    safe_exec_success = False
+    safe_exec_failure = False
+    try:
+        success_events = safe.events.ExecutionSuccess().process_receipt(receipt)
+        failure_events = safe.events.ExecutionFailure().process_receipt(receipt)
+        safe_exec_success = any(
+            event.get("args", {}).get("txHash") == safe_tx_hash for event in success_events
+        )
+        safe_exec_failure = any(
+            event.get("args", {}).get("txHash") == safe_tx_hash for event in failure_events
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not decode Safe execution events for tx=%s condition=%s: %s",
+            tx_hash_hex, condition_id_hex, exc,
+        )
+
+    if safe_exec_failure or not safe_exec_success:
+        error_msg = (
+            "Safe inner redeem call failed"
+            if safe_exec_failure
+            else "Safe execution success could not be confirmed"
+        )
+        log.error(
+            "%s: tx=%s condition=%s safe_tx_hash=%s",
+            error_msg,
+            tx_hash_hex,
+            condition_id_hex,
+            safe_tx_hash.hex() if hasattr(safe_tx_hash, "hex") else safe_tx_hash,
+        )
+        return {
+            "success": False,
+            "tx_hash": tx_hash_hex,
+            "error": error_msg,
+            "gas_used": gas_used,
+            "safe_exec": True,
+            "verified_zero_balance": False,
+            "verified": False,
+            "verification": {
+                "verified": False,
+                "all_zero": False,
+                "checked_positions": [],
+                "safe_exec_success": safe_exec_success,
+                "safe_exec_failure": safe_exec_failure,
+            },
+        }
+
     # --- Phase 2: Post-tx balance verification (Safe as token holder) ---
     verification = _verify_zero_balance(
         ctf=ctf,
@@ -764,6 +825,8 @@ def _redeem_via_safe(
         condition_id_hex=condition_id_hex,
         positions=positions,
     )
+    verification["safe_exec_success"] = safe_exec_success
+    verification["safe_exec_failure"] = safe_exec_failure
 
     return {
         "success": True,
