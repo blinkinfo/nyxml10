@@ -784,14 +784,15 @@ def format_redeem_results(results: list[dict]) -> str:
         size  = r.get("size", 0)
         won   = r.get("won", True)   # default True for backwards-compat
         outcome_label = "WON" if won else "LOST"
-        recovered     = f"${size:.2f}" if won else "$0.00"
         if r.get("success"):
             tx = r.get("tx_hash", "")
             short_tx = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
             gas = r.get("gas_used")
             gas_str = f"  gas={gas:,}" if gas else ""
+            verified = bool(r.get("verified") or r.get("verified_zero_balance"))
+            status_label = "verified" if verified else "submitted"
             lines.append(f"\u2705 {i}. [{outcome_label}] {title}")
-            lines.append(f"   {size:.4f} shares  recovered: {recovered}  tx: <code>{_e(short_tx)}</code>{gas_str}")
+            lines.append(f"   {size:.4f} shares  status: {status_label}  tx: <code>{_e(short_tx)}</code>{gas_str}")
         else:
             err = _e((r.get("error") or "unknown error")[:200])
             lines.append(f"\u274c {i}. [{outcome_label}] {title}")
@@ -812,11 +813,12 @@ def format_auto_redeem_notification(results: list[dict]) -> str:
         title     = _e((r.get("title") or r.get("condition_id", "?"))[:55])
         won       = r.get("won", True)
         outcome_label = "WON" if won else "LOST"
-        recovered     = f"${r.get('size', 0):.2f}" if won else "$0.00"
         tx        = r.get("tx_hash", "")
         short_tx  = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
+        verified  = bool(r.get("verified") or r.get("verified_zero_balance"))
+        status_label = "verified" if verified else "submitted"
         lines.append(f"\u2705 [{outcome_label}] {title}")
-        lines.append(f"   recovered: {recovered}  tx: <code>{_e(short_tx)}</code>")
+        lines.append(f"   status: {status_label}  shares: {r.get('size', 0):.4f}  tx: <code>{_e(short_tx)}</code>")
     for r in failed:
         title = _e((r.get("title") or r.get("condition_id", "?"))[:55])
         won   = r.get("won", True)

@@ -1031,16 +1031,20 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
         merged = {**pos, **result, "dry_run": False}
         results.append(merged)
         try:
+            is_success = bool(result.get("success"))
+            is_verified = is_success and bool(result.get("verified") or result.get("verified_zero_balance"))
+            db_status = "verified" if is_verified else ("success" if is_success else "failed")
             await queries.insert_redemption(
                 condition_id=pos["condition_id"],
                 outcome_index=pos["outcome_index"],
                 size=pos["size"],
                 title=pos.get("title"),
                 tx_hash=result.get("tx_hash"),
-                status="success" if result.get("success") else "failed",
+                status=db_status,
                 error=result.get("error"),
                 gas_used=result.get("gas_used"),
                 dry_run=False,
+                verified=is_verified,
             )
         except Exception:
             log.exception("Failed to persist redemption record for condition=%s", pos.get("condition_id"))

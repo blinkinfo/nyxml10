@@ -13,7 +13,7 @@ Flow
 Contracts (Polygon mainnet)
 ---------------------------
 CTF (ConditionalTokens):  0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
-Primary USDC collateral:  0x3c499c542cef5e3811e1192ce70d8cc03d5c3359
+V2 pUSD collateral:       0x466a756E9A7401B5e2444a3fCB3c2C12FBEc0a54
 """
 
 from __future__ import annotations
@@ -33,7 +33,19 @@ log = logging.getLogger(__name__)
 # Contract addresses (Polygon mainnet)
 # ---------------------------------------------------------------------------
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_ADDRESS = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+PUSD_ADDRESS = "0x466a756E9A7401B5e2444a3fCB3c2C12FBEc0a54"
+
+
+def _resolve_collateral_token(collateral_token: str | None = None) -> str:
+    """Return the checksum collateral token address for redemptions.
+
+    Defaults to Polymarket V2 pUSD collateral unless an explicit override is
+    provided by the caller.
+    """
+    from web3 import Web3  # type: ignore
+
+    token = collateral_token or PUSD_ADDRESS
+    return Web3.to_checksum_address(token)
 
 # Minimal ABI — only the methods we actually call
 _CTF_ABI = [
@@ -238,7 +250,7 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
          Prices in-between mean the market is still live -- skip those.
 
     The on-chain redeemPositions() call with index_sets=[1, 2] handles both
-    outcomes correctly: winning tokens are redeemed for the current Polymarket USDC collateral, losing tokens
+    outcomes correctly: winning tokens are redeemed for the current Polymarket V2 pUSD collateral, losing tokens
     are burned for $0. Calling it for a lost position is safe and necessary
     to clear worthless ERC-1155 tokens from the wallet.
 
@@ -317,16 +329,19 @@ async def redeem_position(
       ``error``                 str | None
       ``gas_used``              int | None
       ``safe_exec``             bool  (True only when Safe path was taken)
-      ``verified_zero_balance`` bool  (True if post-tx balance confirmed zero)
+      ``verified_zero_balance`` bool  (True if post-tx position balances are zero)
+      ``verified``              bool  (True if the redemption is considered verified)
     """
     return await asyncio.to_thread(
         _redeem_position_sync,
         condition_id_hex,
+        collateral_token,
     )
 
 
 def _redeem_position_sync(
     condition_id_hex: str,
+    collateral_token: str | None = None,
 ) -> dict[str, Any]:
     """Synchronous inner implementation — runs in a thread pool.
 
@@ -366,7 +381,7 @@ def _redeem_position_sync(
         # EOA = the account derived from the private key
         eoa_account = w3.eth.account.from_key(private_key).address
 
-        collateral = Web3.to_checksum_address(USDC_ADDRESS)
+        collateral = _resolve_collateral_token(collateral_token)
 
         # parentCollectionId = 0x00...00 (top-level condition)
         parent_collection_id = b"\x00" * 32
@@ -511,6 +526,7 @@ def _redeem_position_sync(
             "gas_used": gas_used,
             "safe_exec": False,
             "verified_zero_balance": verified_zero,
+            "verified": verified_zero,
         }
 
     except Exception as exc:
@@ -686,6 +702,7 @@ def _redeem_via_safe(
         "gas_used": gas_used,
         "safe_exec": True,
         "verified_zero_balance": verified_zero,
+        "verified": verified_zero,
     }
 
 
