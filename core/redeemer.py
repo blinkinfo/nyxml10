@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import traceback
+from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -240,77 +241,139 @@ async def fetch_positions(wallet_address: str) -> list[dict[str, Any]]:
 # Position analysis — which positions are redeemable?
 # ---------------------------------------------------------------------------
 
+def _normalize_condition_id(condition_id: str | None) -> str | None:
+    if not condition_id:
+        return None
+    normalized = str(condition_id).strip()
+    if not normalized:
+        return None
+    if not normalized.startswith("0x"):
+        normalized = "0x" + normalized
+    return normalized
+
+
+def _normalize_collateral_token_for_position(position: dict[str, Any]) -> str | None:
+    for key in ("collateralToken", "collateral_token", "collateralAddress", "collateral_address"):
+        value = position.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _candidate_index_sets(outcome_index: int | None, outcome_count: int | None) -> list[int]:
+    if outcome_count and outcome_count > 0:
+        return [1 << idx for idx in range(outcome_count)]
+    if outcome_index is None or outcome_index < 0:
+        return [1, 2]
+    highest = max(outcome_index + 1, 2)
+    return [1 << idx for idx in range(highest)]
+
+
+def _build_redeemable_entry(pos: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        size = float(pos.get("size", 0) or 0)
+        if size < 0.001:
+            return None
+        if not pos.get("redeemable"):
+            return None
+
+        cur_price = float(pos.get("curPrice") or 0)
+        won = cur_price >= 0.99
+        lost = cur_price <= 0.01
+        if not (won or lost):
+            return None
+
+        condition_id = _normalize_condition_id(pos.get("conditionId"))
+        if not condition_id:
+            return None
+
+        outcome_index_raw = pos.get("outcomeIndex")
+        outcome_index = int(outcome_index_raw) if outcome_index_raw is not None else None
+        outcome_count_raw = pos.get("outcomeCount") or pos.get("outcomesCount")
+        outcome_count = int(outcome_count_raw) if outcome_count_raw not in (None, "") else None
+        index_sets = _candidate_index_sets(outcome_index, outcome_count)
+        target_index_set = (1 << outcome_index) if outcome_index is not None and outcome_index >= 0 else None
+        title = pos.get("title", condition_id[:16])
+        asset_id = str(pos.get("asset") or pos.get("asset_id") or "") or None
+        collateral_token = _normalize_collateral_token_for_position(pos)
+
+        return {
+            "condition_id": condition_id,
+            "outcome_index": outcome_index,
+            "size": size,
+            "title": title,
+            "raw": pos,
+            "cur_price": cur_price,
+            "won": won,
+            "asset_id": asset_id,
+            "collateral_token": collateral_token,
+            "index_sets": index_sets,
+            "target_index_set": target_index_set,
+            "outcome_count": outcome_count,
+        }
+    except Exception:
+        log.exception("Error inspecting position %r", pos)
+        return None
+
+
 def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter *positions* to those that can be redeemed right now.
+    """Return one actionable redemption candidate per condition.
 
-    A position is redeemable when ALL of the following hold:
-      1. size > 0.001  (we hold tokens)
-      2. redeemable == True  (market is resolved, API already computed this)
-      3. curPrice is settled: >= 0.99 (won) OR <= 0.01 (lost)
-         Prices in-between mean the market is still live -- skip those.
-
-    The on-chain redeemPositions() call with index_sets=[1, 2] handles both
-    outcomes correctly: winning tokens are redeemed for the current Polymarket V2 pUSD collateral, losing tokens
-    are burned for $0. Calling it for a lost position is safe and necessary
-    to clear worthless ERC-1155 tokens from the wallet.
-
-    API schema (flat Polymarket Data API /positions response):
-      conditionId, size, curPrice, redeemable, outcomeIndex, outcome, title
-
-    Returns a list of dicts with:
-      condition_id, outcome_index, size, title, raw, cur_price, won
-    The `won` field is True when curPrice >= 0.99, False when curPrice <= 0.01.
+    The Data API reports positions per outcome token, but the on-chain redemption
+    call operates at the condition level. We therefore group by condition and keep
+    enough metadata to verify that the actual relevant token positions disappear
+    after execution.
     """
-    redeemable: list[dict[str, Any]] = []
+    grouped: dict[tuple[str, str | None], list[dict[str, Any]]] = defaultdict(list)
 
     for pos in positions:
-        try:
-            # 1. Must hold tokens
-            size = float(pos.get("size", 0) or 0)
-            if size < 0.001:
-                continue
-
-            # 2. Market must be resolved (API pre-computed flag)
-            if not pos.get("redeemable"):
-                continue
-
-            # 3. Outcome must be settled: won (>=0.99) or lost (<=0.01).
-            #    Prices between 0.01 and 0.99 mean the market is still live.
-            cur_price = float(pos.get("curPrice") or 0)
-            won = cur_price >= 0.99
-            lost = cur_price <= 0.01
-            if not (won or lost):
-                continue
-
-            # conditionId -- ensure 0x prefix
-            condition_id = pos.get("conditionId", "")
-            if not condition_id:
-                continue
-            if not condition_id.startswith("0x"):
-                condition_id = "0x" + condition_id
-
-            outcome_index = int(pos["outcomeIndex"])
-            title = pos.get("title", condition_id[:16])
-
-            redeemable.append({
-                "condition_id":  condition_id,
-                "outcome_index": outcome_index,
-                "size":          size,
-                "title":         title,
-                "raw":           pos,
-                "cur_price":     cur_price,
-                "won":           won,
-            })
-
-        except Exception:
-            log.exception("Error inspecting position %r", pos)
+        entry = _build_redeemable_entry(pos)
+        if entry is None:
             continue
+        grouped[(entry["condition_id"], entry.get("collateral_token"))].append(entry)
+
+    redeemable: list[dict[str, Any]] = []
+    for (condition_id, collateral_token), entries in grouped.items():
+        entries.sort(key=lambda item: (item.get("won") is not True, -(item.get("size") or 0)))
+        primary = dict(entries[0])
+        unique_index_sets: list[int] = []
+        seen_index_sets: set[int] = set()
+        outcome_index_entries: list[dict[str, Any]] = []
+        for entry in entries:
+            target_index_set = entry.get("target_index_set")
+            if target_index_set is not None and target_index_set not in seen_index_sets:
+                seen_index_sets.add(target_index_set)
+                unique_index_sets.append(target_index_set)
+                outcome_index_entries.append({
+                    "outcome_index": entry.get("outcome_index"),
+                    "index_set": target_index_set,
+                    "asset_id": entry.get("asset_id"),
+                    "size": entry.get("size"),
+                    "won": entry.get("won"),
+                    "title": entry.get("title"),
+                })
+        if not unique_index_sets:
+            for fallback_index_set in primary.get("index_sets") or [1, 2]:
+                if fallback_index_set not in seen_index_sets:
+                    seen_index_sets.add(fallback_index_set)
+                    unique_index_sets.append(fallback_index_set)
+
+        primary["collateral_token"] = collateral_token
+        primary["index_sets"] = unique_index_sets
+        primary["positions"] = outcome_index_entries
+        primary["asset_ids"] = [p["asset_id"] for p in outcome_index_entries if p.get("asset_id")]
+        primary["won_count"] = sum(1 for entry in entries if entry.get("won"))
+        primary["lost_count"] = sum(1 for entry in entries if entry.get("won") is False)
+        primary["position_count"] = len(entries)
+        redeemable.append(primary)
 
     return redeemable
 
 async def redeem_position(
     condition_id_hex: str,
     collateral_token: str | None = None,
+    index_sets: list[int] | None = None,
+    positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Call CTF.redeemPositions() on Polygon for one condition.
 
@@ -336,12 +399,16 @@ async def redeem_position(
         _redeem_position_sync,
         condition_id_hex,
         collateral_token,
+        index_sets,
+        positions,
     )
 
 
 def _redeem_position_sync(
     condition_id_hex: str,
     collateral_token: str | None = None,
+    index_sets: list[int] | None = None,
+    positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Synchronous inner implementation — runs in a thread pool.
 
@@ -398,9 +465,9 @@ def _redeem_position_sync(
                 "verified_zero_balance": False,
             }
 
-        # indexSets — pass [1, 2] to redeem all outcomes per Polymarket docs.
-        # The contract burns only winning tokens and ignores losing ones.
-        index_sets = [1, 2]
+        requested_index_sets = [int(v) for v in (index_sets or [1, 2]) if int(v) > 0]
+        index_sets = sorted(set(requested_index_sets)) or [1, 2]
+        positions = positions or []
 
         # --- Check payout denominator to confirm resolution ---
         try:
@@ -509,7 +576,7 @@ def _redeem_position_sync(
         )
 
         # --- Phase 2: Post-tx balance verification (EOA path) ---
-        verified_zero = _verify_zero_balance(
+        verification = _verify_zero_balance(
             ctf=ctf,
             token_holder=account,
             collateral=collateral,
@@ -517,6 +584,7 @@ def _redeem_position_sync(
             cid_bytes=cid_bytes,
             index_sets=index_sets,
             condition_id_hex=condition_id_hex,
+            positions=positions,
         )
 
         return {
@@ -525,8 +593,9 @@ def _redeem_position_sync(
             "error": None,
             "gas_used": gas_used,
             "safe_exec": False,
-            "verified_zero_balance": verified_zero,
-            "verified": verified_zero,
+            "verified_zero_balance": verification["all_zero"],
+            "verified": verification["verified"],
+            "verification": verification,
         }
 
     except Exception as exc:
@@ -685,7 +754,7 @@ def _redeem_via_safe(
     )
 
     # --- Phase 2: Post-tx balance verification (Safe as token holder) ---
-    verified_zero = _verify_zero_balance(
+    verification = _verify_zero_balance(
         ctf=ctf,
         token_holder=safe_address,
         collateral=collateral,
@@ -693,6 +762,7 @@ def _redeem_via_safe(
         cid_bytes=cid_bytes,
         index_sets=index_sets,
         condition_id_hex=condition_id_hex,
+        positions=positions,
     )
 
     return {
@@ -701,8 +771,9 @@ def _redeem_via_safe(
         "error": None,
         "gas_used": gas_used,
         "safe_exec": True,
-        "verified_zero_balance": verified_zero,
-        "verified": verified_zero,
+        "verified_zero_balance": verification["all_zero"],
+        "verified": verification["verified"],
+        "verification": verification,
     }
 
 
@@ -714,42 +785,60 @@ def _verify_zero_balance(
     cid_bytes: bytes,
     index_sets: list,
     condition_id_hex: str,
-) -> bool:
-    """Phase 2: Check that all position balances are zero after redemption.
-
-    Returns True if all relevant position balances are confirmed zero.
-    Returns False if any balance > 0 remains (partial/failed redemption) or
-    if the check itself fails (logs a warning and returns False).
-    """
+    positions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Check that the relevant post-redemption position balances are actually zero."""
+    positions = positions or []
     try:
+        checked_positions: list[dict[str, Any]] = []
         all_zero = True
-        for index_set in index_sets:
+        asset_ids = {str(p.get("asset_id")) for p in positions if p.get("asset_id")}
+        relevant_index_sets = sorted({int(p.get("index_set")) for p in positions if p.get("index_set") is not None} or {int(v) for v in index_sets})
+        for index_set in relevant_index_sets:
             collection_id = ctf.functions.getCollectionId(
                 parent_collection_id, cid_bytes, index_set
             ).call()
             position_id = ctf.functions.getPositionId(collateral, collection_id).call()
             balance = ctf.functions.balanceOf(token_holder, position_id).call()
-            if balance > 0:
+            position_id_str = str(position_id)
+            is_relevant = not asset_ids or position_id_str in asset_ids
+            checked_positions.append({
+                "index_set": index_set,
+                "position_id": position_id_str,
+                "balance": int(balance),
+                "relevant": is_relevant,
+            })
+            if is_relevant and balance > 0:
                 log.warning(
                     "Post-redemption balance check: holder=%s position_id=%s balance=%d "
-                    "(condition=%s indexSet=%d) — tokens remain after redemption",
+                    "(condition=%s indexSet=%d) — relevant tokens remain after redemption",
                     token_holder, position_id, balance, condition_id_hex, index_set,
                 )
                 all_zero = False
 
-        if all_zero:
+        verified = all_zero and any(item["relevant"] for item in checked_positions)
+        if verified:
             log.info(
-                "Post-redemption balance check: all positions zero for condition=%s holder=%s",
+                "Post-redemption balance check: relevant positions zero for condition=%s holder=%s",
                 condition_id_hex, token_holder,
             )
-        return all_zero
+        return {
+            "verified": verified,
+            "all_zero": all_zero,
+            "checked_positions": checked_positions,
+        }
 
     except Exception as exc:
         log.warning(
-            "Post-redemption balance verification failed for condition=%s: %s — proceeding",
+            "Post-redemption balance verification failed for condition=%s: %s",
             condition_id_hex, exc,
         )
-        return False
+        return {
+            "verified": False,
+            "all_zero": False,
+            "checked_positions": [],
+            "error": str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +903,12 @@ async def scan_and_redeem(
             })
             continue
 
-        result = await redeem_position(pos["condition_id"], pos.get("collateral_token"))
+        result = await redeem_position(
+            pos["condition_id"],
+            pos.get("collateral_token"),
+            index_sets=pos.get("index_sets"),
+            positions=pos.get("positions"),
+        )
         results.append({
             **pos,
             **result,

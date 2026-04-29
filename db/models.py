@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS redemptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     condition_id TEXT NOT NULL,
-    outcome_index INTEGER NOT NULL,
+    outcome_index INTEGER,
     size REAL NOT NULL,
     title TEXT,
     tx_hash TEXT,
@@ -117,7 +117,9 @@ CREATE TABLE IF NOT EXISTS redemptions (
     dry_run INTEGER NOT NULL DEFAULT 0,
     resolved_at TIMESTAMP,
     verified INTEGER NOT NULL DEFAULT 0,
-    verified_at TIMESTAMP
+    verified_at TIMESTAMP,
+    redemption_key TEXT,
+    attempt_state TEXT NOT NULL DEFAULT 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS ml_config (
@@ -328,6 +330,17 @@ async def migrate_db(db_path: str | None = None) -> None:
                 await db.execute(
                     "ALTER TABLE redemptions ADD COLUMN verified_at TIMESTAMP"
                 )
+            if "redemption_key" not in red_columns:
+                await db.execute(
+                    "ALTER TABLE redemptions ADD COLUMN redemption_key TEXT"
+                )
+            if "attempt_state" not in red_columns:
+                await db.execute(
+                    "ALTER TABLE redemptions ADD COLUMN attempt_state TEXT NOT NULL DEFAULT 'pending'"
+                )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_redemptions_key_attempt_state ON redemptions (redemption_key, dry_run, attempt_state, verified, status)"
+            )
         except Exception as e:
             log.warning("migrate_db: redemptions column migration failed: %s", e)
 

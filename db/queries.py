@@ -15,6 +15,21 @@ VALID_THRESHOLD_MODES = {"real", "demo"}
 VALID_ROLLING_WR_POLICIES = {"FOLLOW", "SKIP", "INVERT", "WARMUP"}
 
 
+def make_redemption_key(condition_id: str, outcome_index: int | None = None) -> str:
+    normalized = str(condition_id or '').strip().lower()
+    if outcome_index is None:
+        return normalized
+    return f"{normalized}:{int(outcome_index)}"
+
+
+def _normalize_redemption_attempt_state(success: bool, verified: bool) -> str:
+    if verified:
+        return "completed"
+    if success:
+        return "broadcast"
+    return "failed"
+
+
 def _db() -> str:
     return cfg.DB_PATH
 
@@ -924,7 +939,7 @@ async def get_trades_by_signal(signal_id: int) -> list[dict[str, Any]]:
 
 async def insert_redemption(
     condition_id: str,
-    outcome_index: int,
+    outcome_index: int | None,
     size: float,
     title: str | None,
     tx_hash: str | None,
@@ -933,13 +948,17 @@ async def insert_redemption(
     gas_used: int | None = None,
     dry_run: bool = False,
     verified: bool = False,
+    redemption_key: str | None = None,
+    attempt_state: str | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     resolved_at = now if status in ("success", "failed", "verified") else None
     verified_at = now if verified else None
+    redemption_key = redemption_key or make_redemption_key(condition_id, outcome_index)
+    attempt_state = attempt_state or _normalize_redemption_attempt_state(status in ("success", "verified"), verified)
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
-            "INSERT INTO redemptions (condition_id, outcome_index, size, title, tx_hash, status, error, gas_used, dry_run, resolved_at, verified, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO redemptions (condition_id, outcome_index, size, title, tx_hash, status, error, gas_used, dry_run, resolved_at, verified, verified_at, redemption_key, attempt_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 condition_id,
                 outcome_index,
@@ -953,6 +972,8 @@ async def insert_redemption(
                 resolved_at,
                 1 if verified else 0,
                 verified_at,
+                redemption_key,
+                attempt_state,
             ),
         )
         await db.commit()
@@ -970,12 +991,13 @@ async def get_recent_redemptions(n: int = 20) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-async def redemption_already_recorded(condition_id: str) -> bool:
+async def redemption_already_recorded(condition_id: str, outcome_index: int | None = None) -> bool:
+    redemption_key = make_redemption_key(condition_id, outcome_index)
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id FROM redemptions WHERE condition_id = ? AND dry_run = 0 AND (status = 'verified' OR (status = 'success' AND verified = 1)) LIMIT 1",
-            (condition_id,),
+            "SELECT id FROM redemptions WHERE redemption_key = ? AND dry_run = 0 AND attempt_state IN ('pending', 'broadcast', 'completed') LIMIT 1",
+            (redemption_key,),
         )
         row = await cursor.fetchone()
         return row is not None

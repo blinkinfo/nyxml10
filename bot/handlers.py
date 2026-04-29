@@ -1027,7 +1027,23 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
         return
     results: list[dict] = []
     for pos in preview:
-        result = await redeem_position(pos["condition_id"], pos.get("collateral_token"))
+        if await queries.redemption_already_recorded(pos["condition_id"], pos.get("outcome_index")):
+            results.append({
+                **pos,
+                "success": False,
+                "tx_hash": None,
+                "error": "Redemption already pending, broadcast, or completed for this position",
+                "gas_used": None,
+                "dry_run": False,
+                "skipped_duplicate": True,
+            })
+            continue
+        result = await redeem_position(
+            pos["condition_id"],
+            pos.get("collateral_token"),
+            index_sets=pos.get("index_sets"),
+            positions=pos.get("positions"),
+        )
         merged = {**pos, **result, "dry_run": False}
         results.append(merged)
         try:
@@ -1036,7 +1052,7 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
             db_status = "verified" if is_verified else ("success" if is_success else "failed")
             await queries.insert_redemption(
                 condition_id=pos["condition_id"],
-                outcome_index=pos["outcome_index"],
+                outcome_index=pos.get("outcome_index"),
                 size=pos["size"],
                 title=pos.get("title"),
                 tx_hash=result.get("tx_hash"),
@@ -1045,6 +1061,8 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
                 gas_used=result.get("gas_used"),
                 dry_run=False,
                 verified=is_verified,
+                redemption_key=queries.make_redemption_key(pos["condition_id"], pos.get("outcome_index")),
+                attempt_state="completed" if is_verified else ("broadcast" if is_success else "failed"),
             )
         except Exception:
             log.exception("Failed to persist redemption record for condition=%s", pos.get("condition_id"))

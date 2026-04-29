@@ -293,7 +293,8 @@ async def _auto_redeem_job() -> None:
     new_results: list[dict] = []
     for r in results:
         cid = r.get("condition_id", "")
-        if await queries.redemption_already_recorded(cid):
+        outcome_index = r.get("outcome_index")
+        if await queries.redemption_already_recorded(cid, outcome_index):
             continue
         new_results.append(r)
     if not new_results:
@@ -305,7 +306,7 @@ async def _auto_redeem_job() -> None:
             db_status = "verified" if is_verified else ("success" if is_success else "failed")
             await queries.insert_redemption(
                 condition_id=r["condition_id"],
-                outcome_index=r["outcome_index"],
+                outcome_index=r.get("outcome_index"),
                 size=r["size"],
                 title=r.get("title"),
                 tx_hash=r.get("tx_hash"),
@@ -314,6 +315,8 @@ async def _auto_redeem_job() -> None:
                 gas_used=r.get("gas_used"),
                 dry_run=False,
                 verified=is_verified,
+                redemption_key=queries.make_redemption_key(r["condition_id"], r.get("outcome_index")),
+                attempt_state="completed" if is_verified else ("broadcast" if is_success else "failed"),
             )
         except Exception:
             log.exception("auto_redeem_job: failed to persist redemption for condition=%s", r.get("condition_id"))
