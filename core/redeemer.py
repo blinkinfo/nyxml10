@@ -769,45 +769,72 @@ def _redeem_via_safe(
 
     safe_exec_success = False
     safe_exec_failure = False
+    safe_exec_confirmed_by = None
+
+    def _norm_hex(value):
+        hex_value = value.hex() if hasattr(value, "hex") else str(value)
+        hex_value = hex_value.lower()
+        return hex_value if hex_value.startswith("0x") else f"0x{hex_value}"
+
+    # First prefer the canonical execTransaction return value if the provider supports eth_call replay.
     try:
-        from eth_utils import event_abi_to_log_topic  # type: ignore
-
-        success_topic = event_abi_to_log_topic(_SAFE_ABI[3])
-        failure_topic = event_abi_to_log_topic(_SAFE_ABI[4])
-        def _norm_hex(value):
-            hex_value = value.hex() if hasattr(value, "hex") else str(value)
-            hex_value = hex_value.lower()
-            return hex_value if hex_value.startswith("0x") else f"0x{hex_value}"
-
-        expected_hash = _norm_hex(safe_tx_hash)
-        success_topic_hex = _norm_hex(success_topic)
-        failure_topic_hex = _norm_hex(failure_topic)
-
-        for log_entry in receipt.get("logs", []) or []:
-            topics = log_entry.get("topics") or []
-            if not topics:
-                continue
-            topic0_hex = _norm_hex(topics[0])
-            if topic0_hex not in {success_topic_hex, failure_topic_hex}:
-                continue
-            if len(topics) < 2:
-                continue
-            tx_topic_hex = _norm_hex(topics[1])
-            if tx_topic_hex != expected_hash:
-                continue
-            emitter = log_entry.get("address")
-            emitter = emitter.lower() if isinstance(emitter, str) else emitter
-            if emitter != safe_address.lower():
-                continue
-            if topic0_hex == success_topic_hex:
-                safe_exec_success = True
-            elif topic0_hex == failure_topic_hex:
-                safe_exec_failure = True
+        call_result = safe.functions.execTransaction(
+            to,
+            value,
+            data,
+            operation,
+            safe_tx_gas,
+            base_gas,
+            gas_price_safe,
+            gas_token,
+            refund_receiver,
+            signatures,
+        ).call({"from": eoa_account}, block_identifier=receipt.get("blockNumber"))
+        safe_exec_success = bool(call_result)
+        if safe_exec_success:
+            safe_exec_confirmed_by = "call_replay"
     except Exception as exc:
-        log.warning(
-            "Could not inspect Safe execution logs for tx=%s condition=%s: %s",
+        log.info(
+            "Safe execTransaction call replay unavailable for tx=%s condition=%s: %s",
             tx_hash_hex, condition_id_hex, exc,
         )
+
+    # Fall back to receipt log inspection.
+    if not safe_exec_success:
+        try:
+            from eth_utils import event_abi_to_log_topic  # type: ignore
+
+            success_topic = event_abi_to_log_topic(_SAFE_ABI[3])
+            failure_topic = event_abi_to_log_topic(_SAFE_ABI[4])
+            expected_hash = _norm_hex(safe_tx_hash)
+            success_topic_hex = _norm_hex(success_topic)
+            failure_topic_hex = _norm_hex(failure_topic)
+
+            for log_entry in receipt.get("logs", []) or []:
+                topics = log_entry.get("topics") or []
+                if not topics:
+                    continue
+                topic0_hex = _norm_hex(topics[0])
+                if topic0_hex not in {success_topic_hex, failure_topic_hex}:
+                    continue
+                emitter = log_entry.get("address")
+                emitter = emitter.lower() if isinstance(emitter, str) else emitter
+                if emitter != safe_address.lower():
+                    continue
+                indexed_topics = [_norm_hex(topic) for topic in topics[1:]]
+                if expected_hash not in indexed_topics:
+                    continue
+                if topic0_hex == success_topic_hex:
+                    safe_exec_success = True
+                    safe_exec_confirmed_by = "receipt_log"
+                elif topic0_hex == failure_topic_hex:
+                    safe_exec_failure = True
+                    safe_exec_confirmed_by = "receipt_log"
+        except Exception as exc:
+            log.warning(
+                "Could not inspect Safe execution logs for tx=%s condition=%s: %s",
+                tx_hash_hex, condition_id_hex, exc,
+            )
 
     if safe_exec_failure or not safe_exec_success:
         error_msg = (
@@ -836,6 +863,7 @@ def _redeem_via_safe(
                 "checked_positions": [],
                 "safe_exec_success": safe_exec_success,
                 "safe_exec_failure": safe_exec_failure,
+                "safe_exec_confirmed_by": safe_exec_confirmed_by,
             },
         }
 
@@ -852,6 +880,7 @@ def _redeem_via_safe(
     )
     verification["safe_exec_success"] = safe_exec_success
     verification["safe_exec_failure"] = safe_exec_failure
+    verification["safe_exec_confirmed_by"] = safe_exec_confirmed_by
 
     return {
         "success": True,

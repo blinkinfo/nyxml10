@@ -341,6 +341,102 @@ def test_safe_exec_log_scan_detects_success_without_abi_decoding(monkeypatch):
     assert result["verification"]["safe_exec_failure"] is False
 
 
+def test_safe_exec_call_replay_confirms_success_without_logs(monkeypatch):
+    class _CallValue:
+        def __init__(self, value):
+            self._value = value
+
+        def call(self):
+            return self._value
+
+    class _ExecTxBuilder:
+        def __init__(self, call_result=True):
+            self._call_result = call_result
+
+        def estimate_gas(self, tx):
+            return 150000
+
+        def build_transaction(self, tx):
+            return tx
+
+        def call(self, tx=None, block_identifier=None):
+            return self._call_result
+
+    safe_tx_hash = b"4" * 32
+
+    class _SafeFunctions:
+        def nonce(self):
+            return _CallValue(7)
+
+        def getTransactionHash(self, *args):
+            return _CallValue(safe_tx_hash)
+
+        def execTransaction(self, *args):
+            return _ExecTxBuilder(call_result=True)
+
+    class _SafeContract:
+        def __init__(self):
+            self.functions = _SafeFunctions()
+            self.events = type("Events", (), {})()
+
+    class _Eth:
+        gas_price = 1
+
+        def __init__(self):
+            self.account = type(
+                "Account",
+                (),
+                {
+                    "_sign_hash": staticmethod(lambda tx_hash, private_key=None: type("SignedHash", (), {"v": 27, "r": 1, "s": 2})()),
+                    "sign_transaction": staticmethod(lambda tx, private_key=None: type("SignedTx", (), {"raw_transaction": b"raw"})()),
+                },
+            )()
+
+        def contract(self, address=None, abi=None):
+            return _SafeContract()
+
+        def get_transaction_count(self, account):
+            return 3
+
+        def send_raw_transaction(self, raw):
+            return type("TxHash", (), {"hex": lambda self: "0xdef"})()
+
+        def wait_for_transaction_receipt(self, tx_hash, timeout=120):
+            return {"status": 1, "gasUsed": 12345, "blockNumber": 999, "logs": []}
+
+    class _Web3:
+        def __init__(self):
+            self.eth = _Eth()
+
+    monkeypatch.setattr(redeemer.cfg, "POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000001")
+    monkeypatch.setattr(redeemer, "CTF_ADDRESS", "0x0000000000000000000000000000000000000002")
+    monkeypatch.setattr(redeemer, "_verify_zero_balance", lambda **kwargs: {"verified": True, "all_zero": True, "checked_positions": []})
+    monkeypatch.setitem(
+        sys.modules,
+        "web3",
+        types.SimpleNamespace(Web3=types.SimpleNamespace(to_checksum_address=staticmethod(lambda value: value))),
+    )
+
+    result = redeemer._redeem_via_safe(
+        w3=_Web3(),
+        ctf=object(),
+        eoa_account="0x0000000000000000000000000000000000000003",
+        private_key="0x01",
+        redeem_calldata=b"data",
+        collateral="0x0000000000000000000000000000000000000004",
+        parent_collection_id=bytes(32),
+        cid_bytes=bytes.fromhex("11" * 32),
+        index_sets=[1, 2],
+        condition_id_hex="0x" + "22" * 32,
+        positions=[{"index_set": 1, "asset_id": "101"}],
+    )
+
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["verification"]["safe_exec_success"] is True
+    assert result["verification"]["safe_exec_confirmed_by"] == "call_replay"
+
+
 def test_redemption_duplicate_prevention_blocks_pending_and_completed_attempts():
     async def _run():
         fd, path = tempfile.mkstemp(suffix='.db')
